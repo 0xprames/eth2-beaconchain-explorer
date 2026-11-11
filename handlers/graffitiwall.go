@@ -1,11 +1,12 @@
 package handlers
 
 import (
-	"eth2-exporter/db"
-	"eth2-exporter/templates"
-	"eth2-exporter/types"
-	"eth2-exporter/utils"
 	"net/http"
+
+	"github.com/gobitfly/eth2-beaconchain-explorer/db"
+	"github.com/gobitfly/eth2-beaconchain-explorer/templates"
+	"github.com/gobitfly/eth2-beaconchain-explorer/types"
+	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
 )
 
 func Graffitiwall(w http.ResponseWriter, r *http.Request) {
@@ -23,7 +24,7 @@ func Graffitiwall(w http.ResponseWriter, r *http.Request) {
 
 	if err != nil {
 		utils.LogError(err, "error retrieving graffitiwall data", 0)
-		http.Error(w, "Internal server error", http.StatusServiceUnavailable)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 

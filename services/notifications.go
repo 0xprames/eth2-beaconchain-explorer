@@ -9,13 +9,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"eth2-exporter/db"
-	ethclients "eth2-exporter/ethClients"
-	"eth2-exporter/mail"
-	"eth2-exporter/metrics"
-	"eth2-exporter/notify"
-	"eth2-exporter/types"
-	"eth2-exporter/utils"
 	"fmt"
 	"html"
 	"html/template"
@@ -27,8 +20,16 @@ import (
 	"strings"
 	"time"
 
+	"github.com/gobitfly/eth2-beaconchain-explorer/db"
+	ethclients "github.com/gobitfly/eth2-beaconchain-explorer/ethClients"
+	"github.com/gobitfly/eth2-beaconchain-explorer/mail"
+	"github.com/gobitfly/eth2-beaconchain-explorer/metrics"
+	"github.com/gobitfly/eth2-beaconchain-explorer/notify"
+	"github.com/gobitfly/eth2-beaconchain-explorer/types"
+	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
+
 	gcp_bigtable "cloud.google.com/go/bigtable"
-	"firebase.google.com/go/messaging"
+	"firebase.google.com/go/v4/messaging"
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/jmoiron/sqlx"
 	"github.com/lib/pq"
@@ -47,7 +48,7 @@ func notificationCollector() {
 		latestFinalizedEpoch := LatestFinalizedEpoch()
 
 		if latestFinalizedEpoch < 4 {
-			logger.Errorf("pausing notifications until at least 4 epochs have been exported into the db")
+			logger.Errorf("pausing notifications until at least 5 epochs have been exported into the db")
 			time.Sleep(time.Minute)
 			continue
 		}
@@ -115,7 +116,7 @@ func notificationCollector() {
 				if err != nil {
 					logger.Errorf("error collection user db notifications: %v", err)
 					ReportStatus("notification-collector", "Error", nil)
-					time.Sleep(time.Second * 120)
+					time.Sleep(time.Minute * 2)
 					continue
 				}
 
@@ -139,7 +140,7 @@ func notificationCollector() {
 func notificationSender() {
 	for {
 		start := time.Now()
-		ctx, cancel := context.WithTimeout(context.Background(), time.Second*300)
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute*5)
 
 		conn, err := db.FrontendWriterDB.Conn(ctx)
 		if err != nil {
@@ -374,13 +375,6 @@ func collectUserDbNotifications(epoch uint64) (map[uint64]map[types.EventName][]
 		return nil, fmt.Errorf("error collecting Eth client notifications: %v", err)
 	}
 
-	//Tax Report
-	err = collectTaxReportNotificationNotifications(notificationsByUserID, types.TaxReportEventName)
-	if err != nil {
-		metrics.Errors.WithLabelValues("notifications_collect_tax_report").Inc()
-		return nil, fmt.Errorf("error collecting tax report notifications: %v", err)
-	}
-
 	return notificationsByUserID, nil
 }
 
@@ -610,7 +604,7 @@ func sendPushNotifications(useDB *sqlx.DB) error {
 				end = len(n.Content.Messages)
 			}
 
-			err = notify.SendPushBatch(n.Content.Messages[start:end])
+			err = notify.SendPushBatch(n.Content.Messages[start:end], false)
 			if err != nil {
 				metrics.Errors.WithLabelValues("notifications_send_push_batch").Inc()
 				logger.WithError(err).Error("error sending firebase batch job")
@@ -727,7 +721,12 @@ func queueEmailNotifications(notificationsByUserID map[uint64]map[types.EventNam
 						unsubURL += "&hash=" + html.EscapeString(unsubHash)
 					}
 					msg.UnSubURL = template.HTML(fmt.Sprintf(`<a style="color: white" onMouseOver="this.style.color='#F5B498'" onMouseOut="this.style.color='#FFFFFF'" href="%v">Unsubscribe</a>`, unsubURL))
-					msg.Body += template.HTML(fmt.Sprintf("%s<br>", n.GetInfo(true)))
+
+					if event != types.SyncCommitteeSoon {
+						// SyncCommitteeSoon notifications are summed up in getEventInfo for all validators
+						msg.Body += template.HTML(fmt.Sprintf("%s<br>", n.GetInfo(true)))
+					}
+
 					if att := n.GetEmailAttachment(); att != nil {
 						attachments = append(attachments, *att)
 					}
@@ -735,8 +734,9 @@ func queueEmailNotifications(notificationsByUserID map[uint64]map[types.EventNam
 					metrics.NotificationsQueued.WithLabelValues("email", string(event)).Inc()
 				}
 
-				if event == "validator_balance_decreased" {
-					msg.Body += template.HTML("<br>You will not receive any further balance decrease mails for these validators until the balance of a validator is increasing again.<br>")
+				eventInfo := getEventInfo(event, ns)
+				if eventInfo != "" {
+					msg.Body += template.HTML(fmt.Sprintf("%s<br>", eventInfo))
 				}
 			}
 
@@ -991,7 +991,7 @@ func sendWebhookNotifications(useDB *sqlx.DB) error {
 			}
 			resp, err := client.Post(n.Content.Webhook.Url, "application/json", reqBody)
 			if err != nil {
-				logger.WithError(err).Errorf("error sending request")
+				logger.WithError(err).Warnf("error sending request")
 			} else {
 				metrics.NotificationsSent.WithLabelValues("webhook", resp.Status).Inc()
 			}
@@ -1014,11 +1014,11 @@ func sendWebhookNotifications(useDB *sqlx.DB) error {
 				if resp != nil {
 					b, err := io.ReadAll(resp.Body)
 					if err != nil {
-						logger.WithError(err).Error("error reading body")
+						logger.WithError(err).Warn("error reading body")
+					} else {
+						errResp.Status = resp.Status
+						errResp.Body = string(b)
 					}
-
-					errResp.Status = resp.Status
-					errResp.Body = string(b)
 				}
 
 				_, err = useDB.Exec(`UPDATE users_webhooks SET retries = retries + 1, last_sent = now(), request = $2, response = $3 WHERE id = $1;`, n.Content.Webhook.ID, n.Content, errResp)
@@ -1133,7 +1133,7 @@ func sendDiscordNotifications(useDB *sqlx.DB) error {
 					if strings.Contains(errResp.Body, "You are being rate limited") {
 						logger.Warnf("could not push to discord webhook due to rate limit. %v url: %v", errResp.Body, webhook.Url)
 					} else {
-						utils.LogError(nil, "error pushing discord webhook", 0, map[string]interface{}{"errResp.Body": errResp.Body, "webhook.Url": webhook.Url})
+						utils.LogWarn(nil, "error pushing discord webhook", 0, map[string]interface{}{"errResp.Body": errResp.Body, "webhook.Url": webhook.Url})
 					}
 					_, err = useDB.Exec(`UPDATE users_webhooks SET request = $2, response = $3 WHERE id = $1;`, webhook.ID, reqs[i].Content.DiscordRequest, errResp)
 					if err != nil {
@@ -1214,7 +1214,7 @@ func collectBlockProposalNotifications(notificationsByUserID map[uint64]map[type
 	}
 
 	for _, event := range events {
-		pubkey, err := GetGetPubkeyForIndex(event.Proposer)
+		pubkey, err := GetPubkeyForIndex(event.Proposer)
 		if err != nil {
 			utils.LogError(err, "error retrieving pubkey for validator", 0, map[string]interface{}{"validator": event.Proposer})
 			continue
@@ -1299,20 +1299,25 @@ func (n *validatorProposalNotification) GetEventName() types.EventName {
 }
 
 func (n *validatorProposalNotification) GetInfo(includeUrl bool) string {
-	var generalPart = ""
+	var generalPart, suffix string
+	vali := strconv.FormatUint(n.ValidatorIndex, 10)
+	slot := strconv.FormatUint(n.Slot, 10)
+	if includeUrl {
+		vali = fmt.Sprintf(`<a href="https://%[1]v/validator/%[2]v">%[2]v</a>`, utils.Config.Frontend.SiteDomain, n.ValidatorIndex)
+		slot = fmt.Sprintf(`<a href="https://%[1]v/slot/%[2]v">%[2]v</a>`, utils.Config.Frontend.SiteDomain, n.Slot)
+		suffix = getUrlPart(n.ValidatorIndex)
+	}
 	switch n.Status {
 	case 0:
-		generalPart = fmt.Sprintf(`New scheduled block proposal at slot <a href="https://%[1]v/slot/%[3]v">%[3]v</a> for Validator <a href="https://%[1]v/validator/%[2]v">%[2]v</a>.`, utils.Config.Frontend.SiteDomain, n.ValidatorIndex, n.Slot)
+		generalPart = fmt.Sprintf(`New scheduled block proposal at slot %s for Validator %s.`, slot, vali)
 	case 1:
-		generalPart = fmt.Sprintf(`Validator <a href="https://%[1]v/validator/%[2]v">%[2]v</a> proposed block at slot <a href="https://%[1]v/slot/%[3]v">%[3]v</a> with %[4]v %[5]v execution reward.`, utils.Config.Frontend.SiteDomain, n.ValidatorIndex, n.Slot, n.Reward, utils.Config.Frontend.ElCurrency)
+		generalPart = fmt.Sprintf(`Validator %s proposed block at slot %s with %v %v execution reward.`, vali, slot, n.Reward, utils.Config.Frontend.ElCurrency)
 	case 2:
-		generalPart = fmt.Sprintf(`Validator <a href="https://%[1]v/validator/%[2]v">%[2]v</a> missed a block proposal at slot <a href="https://%[1]v/slot/%[3]v">%[3]v</a>.`, utils.Config.Frontend.SiteDomain, n.ValidatorIndex, n.Slot)
+		generalPart = fmt.Sprintf(`Validator %s missed a block proposal at slot %s.`, vali, slot)
+	case 3:
+		generalPart = fmt.Sprintf(`Validator %s had an orphaned block proposal at slot %s.`, vali, slot)
 	}
-
-	if includeUrl {
-		return generalPart + getUrlPart(n.ValidatorIndex)
-	}
-	return generalPart
+	return generalPart + suffix
 }
 
 func (n *validatorProposalNotification) GetTitle() string {
@@ -1323,6 +1328,8 @@ func (n *validatorProposalNotification) GetTitle() string {
 		return "New Block Proposal"
 	case 2:
 		return "Block Proposal Missed"
+	case 3:
+		return "Block Proposal Missed (Orphaned)"
 	}
 	return "-"
 }
@@ -1340,6 +1347,8 @@ func (n *validatorProposalNotification) GetInfoMarkdown() string {
 		generalPart = fmt.Sprintf(`Validator [%[2]v](https://%[1]v/validator/%[2]v) proposed a new block at slot [%[3]v](https://%[1]v/slot/%[3]v) with %[4]v %[5]v execution reward.`, utils.Config.Frontend.SiteDomain, n.ValidatorIndex, n.Slot, n.Reward, utils.Config.Frontend.ElCurrency)
 	case 2:
 		generalPart = fmt.Sprintf(`Validator [%[2]v](https://%[1]v/validator/%[2]v) missed a block proposal at slot [%[3]v](https://%[1]v/slot/%[3]v).`, utils.Config.Frontend.SiteDomain, n.ValidatorIndex, n.Slot)
+	case 3:
+		generalPart = fmt.Sprintf(`Validator [%[2]v](https://%[1]v/validator/%[2]v) had an orphaned block proposal at slot [%[3]v](https://%[1]v/slot/%[3]v).`, utils.Config.Frontend.SiteDomain, n.ValidatorIndex, n.Slot)
 	}
 
 	return generalPart
@@ -1355,8 +1364,6 @@ func collectAttestationAndOfflineValidatorNotifications(notificationsByUserID ma
 		ValidatorIndex uint64 `db:"validatorindex"`
 		Epoch          uint64 `db:"epoch"`
 		Status         uint64 `db:"status"`
-		Slot           uint64 `db:"attesterslot"`
-		InclusionSlot  uint64 `db:"inclusionslot"`
 		EventFilter    []byte `db:"pubkey"`
 	}
 
@@ -1367,50 +1374,40 @@ func collectAttestationAndOfflineValidatorNotifications(notificationsByUserID ma
 		return err
 	}
 
-	attestations, err := db.BigtableClient.GetValidatorAttestationHistory(validators, epoch-3, epoch)
+	participationPerEpoch, err := db.GetValidatorAttestationHistoryForNotifications(epoch-3, epoch)
 	if err != nil {
-		return fmt.Errorf("error getting validator attestations from bigtable %w", err)
+		return fmt.Errorf("error getting validator attestations from db %w", err)
 	}
 
 	logger.Infof("retrieved validator attestation history data")
 
 	events := make([]dbResult, 0)
 
-	epochAttested := make(map[uint64]uint64)
-	epochTotal := make(map[uint64]uint64)
-	participationPerEpoch := make(map[uint64]map[uint64]int) // map[validatorindex]map[epoch]attested
-	for validator, history := range attestations {
-		for _, attestation := range history {
-			if participationPerEpoch[validator] == nil {
-				participationPerEpoch[validator] = make(map[uint64]int, 4)
-			}
-			epochTotal[attestation.Epoch] = epochTotal[attestation.Epoch] + 1 // count the total attestations for each epoch
+	epochAttested := make(map[types.Epoch]uint64)
+	epochTotal := make(map[types.Epoch]uint64)
+	for currentEpoch, participation := range participationPerEpoch {
+		for validatorIndex, participated := range participation {
 
-			if attestation.Status == 0 {
+			epochTotal[currentEpoch] = epochTotal[currentEpoch] + 1 // count the total attestations for each epoch
 
-				participationPerEpoch[validator][attestation.Epoch] = 1 // missed
-
-				pubkey, err := GetGetPubkeyForIndex(validator)
+			if !participated {
+				pubkey, err := GetPubkeyForIndex(uint64(validatorIndex))
 				if err == nil {
-					if attestation.Epoch != epoch || subMap[hex.EncodeToString(pubkey)] == nil {
+					if currentEpoch != types.Epoch(epoch) || subMap[hex.EncodeToString(pubkey)] == nil {
 						continue
 					}
 
 					events = append(events, dbResult{
-						ValidatorIndex: validator,
-						Epoch:          attestation.Epoch,
-						Status:         attestation.Status,
-						Slot:           attestation.AttesterSlot,
-						InclusionSlot:  attestation.InclusionSlot,
+						ValidatorIndex: uint64(validatorIndex),
+						Epoch:          uint64(currentEpoch),
+						Status:         0,
 						EventFilter:    pubkey,
 					})
 				} else {
-					logger.Errorf("error retrieving pubkey for validator %v: %v", validator, err)
+					logger.Errorf("error retrieving pubkey for validator %v: %v", validatorIndex, err)
 				}
 			} else {
-				participationPerEpoch[validator][attestation.Epoch] = 2 // attested
-
-				epochAttested[attestation.Epoch] = epochAttested[attestation.Epoch] + 1 // count the total attested attestation for each epoch (exlude missing)
+				epochAttested[currentEpoch] = epochAttested[currentEpoch] + 1 // count the total attested attestation for each epoch (exlude missing)
 			}
 		}
 	}
@@ -1440,8 +1437,6 @@ func collectAttestationAndOfflineValidatorNotifications(notificationsByUserID ma
 				Epoch:          event.Epoch,
 				Status:         event.Status,
 				EventName:      types.ValidatorMissedAttestationEventName,
-				Slot:           event.Slot,
-				InclusionSlot:  event.InclusionSlot,
 				EventFilter:    hex.EncodeToString(event.EventFilter),
 			}
 			if _, exists := notificationsByUserID[*sub.UserID]; !exists {
@@ -1472,11 +1467,11 @@ func collectAttestationAndOfflineValidatorNotifications(notificationsByUserID ma
 	var offlineValidators []*indexPubkeyPair
 	var onlineValidators []*indexPubkeyPair
 
-	epochNMinus1 := epoch - 1
-	epochNMinus2 := epoch - 2
-	epochNMinus3 := epoch - 3
+	epochNMinus1 := types.Epoch(epoch - 1)
+	epochNMinus2 := types.Epoch(epoch - 2)
+	epochNMinus3 := types.Epoch(epoch - 3)
 
-	if epochTotal[epoch] == 0 {
+	if epochTotal[types.Epoch(epoch)] == 0 {
 		return fmt.Errorf("consistency error, did not retrieve attestation data for epoch %v", epoch)
 	}
 	if epochTotal[epochNMinus1] == 0 {
@@ -1489,8 +1484,8 @@ func collectAttestationAndOfflineValidatorNotifications(notificationsByUserID ma
 		return fmt.Errorf("consistency error, did not retrieve attestation data for epoch %v", epochNMinus3)
 	}
 
-	if epochAttested[epoch]*100/epochTotal[epoch] < 60 {
-		return fmt.Errorf("consistency error, did receive more than 60%% of missed attestation in epoch %v (total: %v, attested: %v)", epoch, epochTotal[epoch], epochAttested[epoch])
+	if epochAttested[types.Epoch(epoch)]*100/epochTotal[types.Epoch(epoch)] < 60 {
+		return fmt.Errorf("consistency error, did receive more than 60%% of missed attestation in epoch %v (total: %v, attested: %v)", epoch, epochTotal[types.Epoch(epoch)], epochAttested[types.Epoch(epoch)])
 	}
 	if epochAttested[epochNMinus1]*100/epochTotal[epochNMinus1] < 60 {
 		return fmt.Errorf("consistency error, did receive more than 60%% of missed attestation in epoch %v (total: %v, attested: %v)", epochNMinus1, epochTotal[epochNMinus1], epochAttested[epochNMinus1])
@@ -1502,24 +1497,25 @@ func collectAttestationAndOfflineValidatorNotifications(notificationsByUserID ma
 		return fmt.Errorf("consistency error, did receive more than 60%% of missed attestation in epoch %v (total: %v, attested: %v)", epochNMinus3, epochTotal[epochNMinus3], epochAttested[epochNMinus3])
 	}
 
-	for validator, participation := range participationPerEpoch {
-		if participation[epochNMinus3] == 2 && participation[epochNMinus2] == 1 && participation[epochNMinus1] == 1 && participation[epoch] == 1 {
+	for _, validator := range validators {
+		if participationPerEpoch[epochNMinus3][types.ValidatorIndex(validator)] && !participationPerEpoch[epochNMinus2][types.ValidatorIndex(validator)] && !participationPerEpoch[epochNMinus1][types.ValidatorIndex(validator)] && !participationPerEpoch[types.Epoch(epoch)][types.ValidatorIndex(validator)] {
 			logger.Infof("validator %v detected as offline in epoch %v (did not attest since epoch %v)", validator, epoch, epochNMinus2)
-			pubkey, err := GetGetPubkeyForIndex(validator)
+			pubkey, err := GetPubkeyForIndex(validator)
 			if err != nil {
 				return err
 			}
 			offlineValidators = append(offlineValidators, &indexPubkeyPair{Index: validator, Pubkey: pubkey})
 		}
 
-		if participation[epochNMinus3] == 1 && participation[epochNMinus2] == 1 && participation[epochNMinus1] == 1 && participation[epoch] == 2 {
+		if !participationPerEpoch[epochNMinus3][types.ValidatorIndex(validator)] && !participationPerEpoch[epochNMinus2][types.ValidatorIndex(validator)] && !participationPerEpoch[epochNMinus1][types.ValidatorIndex(validator)] && participationPerEpoch[types.Epoch(epoch)][types.ValidatorIndex(validator)] {
 			logger.Infof("validator %v detected as online in epoch %v (attested again in epoch %v)", validator, epoch, epoch)
-			pubkey, err := GetGetPubkeyForIndex(validator)
+			pubkey, err := GetPubkeyForIndex(validator)
 			if err != nil {
 				return err
 			}
 			onlineValidators = append(onlineValidators, &indexPubkeyPair{Index: validator, Pubkey: pubkey})
 		}
+
 	}
 
 	offlineValidatorsLimit := 5000
@@ -1679,9 +1675,9 @@ func (n *validatorIsOfflineNotification) GetEpoch() uint64 {
 func (n *validatorIsOfflineNotification) GetInfo(includeUrl bool) string {
 	if n.IsOffline {
 		if includeUrl {
-			return fmt.Sprintf(`Validator <a href="https://%[3]v/validator/%[1]v">%[1]v</a> is offline since epoch <a href="https://%[3]v/epoch/%[2]v">%[2]v</a>).`, n.ValidatorIndex, n.EventEpoch, utils.Config.Frontend.SiteDomain)
+			return fmt.Sprintf(`Validator <a href="https://%[3]v/validator/%[1]v">%[1]v</a> is offline since epoch <a href="https://%[3]v/epoch/%[2]s">%[2]s</a>).`, n.ValidatorIndex, n.InternalState, utils.Config.Frontend.SiteDomain)
 		} else {
-			return fmt.Sprintf(`Validator %v is offline since epoch %v.`, n.ValidatorIndex, n.EventEpoch)
+			return fmt.Sprintf(`Validator %v is offline since epoch %s.`, n.ValidatorIndex, n.InternalState)
 		}
 	} else {
 		if includeUrl {
@@ -1730,8 +1726,6 @@ type validatorAttestationNotification struct {
 	Epoch              uint64
 	Status             uint64 // * Can be 0 = scheduled | missed, 1 executed
 	EventName          types.EventName
-	Slot               uint64
-	InclusionSlot      uint64
 	EventFilter        string
 	UnsubscribeHash    sql.NullString
 }
@@ -1757,19 +1751,17 @@ func (n *validatorAttestationNotification) GetInfo(includeUrl bool) string {
 	if includeUrl {
 		switch n.Status {
 		case 0:
-			generalPart = fmt.Sprintf(`Validator <a href="https://%[3]v/validator/%[1]v">%[1]v</a> missed an attestation at slot <a href="https://%[3]v/slot/%[2]v">%[2]v</a>.`, n.ValidatorIndex, n.Slot, utils.Config.Frontend.SiteDomain)
-			//generalPart = fmt.Sprintf(`New scheduled attestation for Validator %v at slot %v.`, n.ValidatorIndex, n.Slot)
+			generalPart = fmt.Sprintf(`Validator <a href="https://%[3]v/validator/%[1]v">%[1]v</a> missed an attestation in epoch <a href="https://%[3]v/epoch/%[2]v">%[2]v</a>.`, n.ValidatorIndex, n.Epoch, utils.Config.Frontend.SiteDomain)
 		case 1:
-			generalPart = fmt.Sprintf(`Validator <a href="https://%[3]v/validator/%[1]v">%[1]v</a> submitted a successful attestation for slot  <a href="https://%[3]v/slot/%[2]v">%[2]v</a>.`, n.ValidatorIndex, n.Slot, utils.Config.Frontend.SiteDomain)
+			generalPart = fmt.Sprintf(`Validator <a href="https://%[3]v/validator/%[1]v">%[1]v</a> submitted a successful attestation for epoch <a href="https://%[3]v/epoch/%[2]v">%[2]v</a>.`, n.ValidatorIndex, n.Epoch, utils.Config.Frontend.SiteDomain)
 		}
 		// return generalPart + getUrlPart(n.ValidatorIndex)
 	} else {
 		switch n.Status {
 		case 0:
-			generalPart = fmt.Sprintf(`Validator %v missed an attestation at slot %v.`, n.ValidatorIndex, n.Slot)
-			//generalPart = fmt.Sprintf(`New scheduled attestation for Validator %v at slot %v.`, n.ValidatorIndex, n.Slot)
+			generalPart = fmt.Sprintf(`Validator %v missed an attestation in epoch %v.`, n.ValidatorIndex, n.Epoch)
 		case 1:
-			generalPart = fmt.Sprintf(`Validator %v submitted a successful attestation for slot %v.`, n.ValidatorIndex, n.Slot)
+			generalPart = fmt.Sprintf(`Validator %v submitted a successful attestation in epoch %v.`, n.ValidatorIndex, n.Epoch)
 		}
 	}
 	return generalPart
@@ -1804,9 +1796,9 @@ func (n *validatorAttestationNotification) GetInfoMarkdown() string {
 	var generalPart = ""
 	switch n.Status {
 	case 0:
-		generalPart = fmt.Sprintf(`Validator [%[1]v](https://%[3]v/validator/%[1]v) missed an attestation at slot [%[2]v](https://%[3]v/slot/%[2]v).`, n.ValidatorIndex, n.Slot, utils.Config.Frontend.SiteDomain)
+		generalPart = fmt.Sprintf(`Validator [%[1]v](https://%[3]v/validator/%[1]v) missed an attestation in epoch [%[2]v](https://%[3]v/epoch/%[2]v).`, n.ValidatorIndex, n.Epoch, utils.Config.Frontend.SiteDomain)
 	case 1:
-		generalPart = fmt.Sprintf(`Validator [%[1]v](https://%[3]v/validator/%[1]v) submitted a successful attestation for slot [%[2]v](https://%[3]v/slot/%[2]v).`, n.ValidatorIndex, n.Slot, utils.Config.Frontend.SiteDomain)
+		generalPart = fmt.Sprintf(`Validator [%[1]v](https://%[3]v/validator/%[1]v) submitted a successful attestation in epoch [%[2]v](https://%[3]v/epoch/%[2]v).`, n.ValidatorIndex, n.Epoch, utils.Config.Frontend.SiteDomain)
 	}
 	return generalPart
 }
@@ -1970,7 +1962,7 @@ func (n *validatorWithdrawalNotification) GetEventName() types.EventName {
 }
 
 func (n *validatorWithdrawalNotification) GetInfo(includeUrl bool) string {
-	generalPart := fmt.Sprintf(`An automatic withdrawal of %v has been processed for validator %v.`, utils.FormatClCurrency(n.Amount, utils.Config.Frontend.MainCurrency, 6, true, false, false), n.ValidatorIndex)
+	generalPart := fmt.Sprintf(`An automatic withdrawal of %v has been processed for validator %v.`, utils.FormatClCurrencyString(n.Amount, utils.Config.Frontend.MainCurrency, 6, true, false, false), n.ValidatorIndex)
 	if includeUrl {
 		return generalPart + getUrlPart(n.ValidatorIndex)
 	}
@@ -1986,7 +1978,7 @@ func (n *validatorWithdrawalNotification) GetEventFilter() string {
 }
 
 func (n *validatorWithdrawalNotification) GetInfoMarkdown() string {
-	generalPart := fmt.Sprintf(`An automatic withdrawal of %[2]v has been processed for validator [%[1]v](https://%[6]v/validator/%[1]v) during slot [%[3]v](https://%[6]v/slot/%[3]v). The funds have been sent to: [%[4]v](https://%[6]v/address/%[4]v).`, n.ValidatorIndex, utils.FormatClCurrency(n.Amount, utils.Config.Frontend.MainCurrency, 6, true, false, false), n.Slot, utils.FormatHashRaw(n.Address), n.Address, utils.Config.Frontend.SiteDomain)
+	generalPart := fmt.Sprintf(`An automatic withdrawal of %[2]v has been processed for validator [%[1]v](https://%[6]v/validator/%[1]v) during slot [%[3]v](https://%[6]v/slot/%[3]v). The funds have been sent to: [%[4]v](https://%[6]v/address/0x%[5]x).`, n.ValidatorIndex, utils.FormatClCurrencyString(n.Amount, utils.Config.Frontend.MainCurrency, 6, true, false, false), n.Slot, utils.FormatHashRaw(n.Address), n.Address, utils.Config.Frontend.SiteDomain)
 	return generalPart
 }
 
@@ -2099,9 +2091,9 @@ func (n *ethClientNotification) GetInfo(includeUrl bool) string {
 		case "Lighthouse":
 			url = "https://github.com/sigp/lighthouse/releases"
 		case "Erigon":
-			url = "https://github.com/ledgerwatch/erigon/releases"
+			url = "https://github.com/erigontech/erigon/releases"
 		case "Rocketpool":
-			url = "https://github.com/rocket-pool/smartnode-install/releases"
+			url = "https://github.com/rocket-pool/smartnode/releases"
 		case "MEV-Boost":
 			url = "https://github.com/flashbots/mev-boost/releases"
 		case "Lodestar":
@@ -2139,9 +2131,9 @@ func (n *ethClientNotification) GetInfoMarkdown() string {
 	case "Lighthouse":
 		url = "https://github.com/sigp/lighthouse/releases"
 	case "Erigon":
-		url = "https://github.com/ledgerwatch/erigon/releases"
+		url = "https://github.com/erigontech/erigon/releases"
 	case "Rocketpool":
-		url = "https://github.com/rocket-pool/smartnode-install/releases"
+		url = "https://github.com/rocket-pool/smartnode/releases"
 	case "MEV-Boost":
 		url = "https://github.com/flashbots/mev-boost/releases"
 	case "Lodestar":
@@ -2489,146 +2481,6 @@ func (n *monitorMachineNotification) GetInfoMarkdown() string {
 	return n.GetInfo(false)
 }
 
-type taxReportNotification struct {
-	SubscriptionID  uint64
-	UserID          uint64
-	Epoch           uint64
-	EventFilter     string
-	UnsubscribeHash sql.NullString
-}
-
-func (n *taxReportNotification) GetLatestState() string {
-	return ""
-}
-
-func (n *taxReportNotification) GetUnsubscribeHash() string {
-	if n.UnsubscribeHash.Valid {
-		return n.UnsubscribeHash.String
-	}
-	return ""
-}
-
-func (n *taxReportNotification) GetEmailAttachment() *types.EmailAttachment {
-	tNow := time.Now()
-	lastDay := time.Date(tNow.Year(), tNow.Month(), 1, 0, 0, 0, 0, time.UTC)
-	firstDay := lastDay.AddDate(0, -1, 0)
-
-	q, err := url.ParseQuery(n.EventFilter)
-
-	if err != nil {
-		logger.Warn("Failed to parse rewards report eventfilter")
-		return nil
-	}
-
-	currency := q.Get("currency")
-
-	validators := []uint64{}
-	valSlice := strings.Split(q.Get("validators"), ",")
-	if len(valSlice) > 0 {
-		for _, val := range valSlice {
-			v, err := strconv.ParseUint(val, 10, 64)
-			if err != nil {
-				continue
-			}
-			validators = append(validators, v)
-		}
-	} else {
-		logger.Warn("Validators Not found in rewards report eventfilter")
-		return nil
-	}
-
-	pdf := GetPdfReport(validators, currency, uint64(firstDay.Unix()), uint64(lastDay.Unix()))
-
-	return &types.EmailAttachment{Attachment: pdf, Name: fmt.Sprintf("income_history_%v_%v.pdf", firstDay.Format("20060102"), lastDay.Format("20060102"))}
-}
-
-func (n *taxReportNotification) GetSubscriptionID() uint64 {
-	return n.SubscriptionID
-}
-
-func (n *taxReportNotification) GetEpoch() uint64 {
-	return n.Epoch
-}
-
-func (n *taxReportNotification) GetEventName() types.EventName {
-	return types.TaxReportEventName
-}
-
-func (n *taxReportNotification) GetInfo(includeUrl bool) string {
-	generalPart := `Please find attached the income history of your selected validators.`
-	return generalPart
-}
-
-func (n *taxReportNotification) GetTitle() string {
-	return "Income Report"
-}
-
-func (n *taxReportNotification) GetEventFilter() string {
-	return n.EventFilter
-}
-
-func (n *taxReportNotification) GetInfoMarkdown() string {
-	return n.GetInfo(false)
-}
-
-func collectTaxReportNotificationNotifications(notificationsByUserID map[uint64]map[types.EventName][]types.Notification, eventName types.EventName) error {
-	lastStatsDay, err := LatestExportedStatisticDay()
-
-	if err != nil {
-		return err
-	}
-	//Check that the last day of the month is already exported
-	tNow := time.Now()
-	firstDayOfMonth := time.Date(tNow.Year(), tNow.Month(), 1, 0, 0, 0, 0, time.UTC)
-	if utils.TimeToDay(uint64(firstDayOfMonth.Unix())) > lastStatsDay {
-		return nil
-	}
-
-	var dbResult []struct {
-		SubscriptionID  uint64         `db:"id"`
-		UserID          uint64         `db:"user_id"`
-		Epoch           uint64         `db:"created_epoch"`
-		EventFilter     string         `db:"event_filter"`
-		UnsubscribeHash sql.NullString `db:"unsubscribe_hash"`
-	}
-
-	name := string(eventName)
-	if utils.Config.Chain.ClConfig.ConfigName != "" {
-		name = utils.Config.Chain.ClConfig.ConfigName + ":" + name
-	}
-
-	err = db.FrontendWriterDB.Select(&dbResult, `
-			SELECT us.id, us.user_id, us.created_epoch, us.event_filter, ENCODE(us.unsubscribe_hash, 'hex') AS unsubscribe_hash
-			FROM users_subscriptions AS us
-			WHERE us.event_name=$1 AND (us.last_sent_ts < $2 OR (us.last_sent_ts IS NULL AND us.created_ts < $2));
-			`,
-		name, firstDayOfMonth)
-
-	if err != nil {
-		return err
-	}
-
-	for _, r := range dbResult {
-		n := &taxReportNotification{
-			SubscriptionID:  r.SubscriptionID,
-			UserID:          r.UserID,
-			Epoch:           r.Epoch,
-			EventFilter:     r.EventFilter,
-			UnsubscribeHash: r.UnsubscribeHash,
-		}
-		if _, exists := notificationsByUserID[r.UserID]; !exists {
-			notificationsByUserID[r.UserID] = map[types.EventName][]types.Notification{}
-		}
-		if _, exists := notificationsByUserID[r.UserID][n.GetEventName()]; !exists {
-			notificationsByUserID[r.UserID][n.GetEventName()] = []types.Notification{}
-		}
-		notificationsByUserID[r.UserID][n.GetEventName()] = append(notificationsByUserID[r.UserID][n.GetEventName()], n)
-		metrics.NotificationsCollected.WithLabelValues(string(n.GetEventName())).Inc()
-	}
-
-	return nil
-}
-
 type networkNotification struct {
 	SubscriptionID  uint64
 	UserID          uint64
@@ -2782,20 +2634,7 @@ func (n *rocketpoolNotification) GetInfo(includeUrl bool) string {
 	case types.RocketpoolCollateralMinReached:
 		return fmt.Sprintf(`Your RPL collateral has reached your configured threshold at %v%%.`, n.ExtraData)
 	case types.SyncCommitteeSoon:
-		extras := strings.Split(n.ExtraData, "|")
-		if len(extras) != 3 {
-			logger.Errorf("Invalid number of arguments passed to sync committee extra data. Notification will not be sent until code is corrected.")
-			return ""
-		}
-		var inTime time.Duration
-		syncStartEpoch, err := strconv.ParseUint(extras[1], 10, 64)
-		if err != nil {
-			inTime = time.Duration(24 * time.Hour)
-		} else {
-			inTime = time.Until(utils.EpochToTime(syncStartEpoch))
-		}
-
-		return fmt.Sprintf(`Your validator %v has been elected to be part of the next sync committee. The additional duties start at epoch %v, which is in %s and will last for about a day until epoch %v.`, extras[0], extras[1], inTime.Round(time.Second), extras[2])
+		return getSyncCommitteeSoonInfo([]types.Notification{n})
 	}
 
 	return ""
@@ -3176,4 +3015,69 @@ type WebhookQueue struct {
 	Destination    sql.NullString `db:"destination"`
 	Payload        []byte         `db:"payload"`
 	LastTry        time.Time      `db:"last_try"`
+}
+
+func getEventInfo(event types.EventName, ns []types.Notification) string {
+	switch event {
+	case types.SyncCommitteeSoon:
+		return getSyncCommitteeSoonInfo(ns)
+	case "validator_balance_decreased":
+		return "<br>You will not receive any further balance decrease mails for these validators until the balance of a validator is increasing again."
+	}
+
+	return ""
+}
+
+func getSyncCommitteeSoonInfo(ns []types.Notification) string {
+	validators := []string{}
+	var startEpoch, endEpoch string
+	var inTime time.Duration
+
+	for i, n := range ns {
+		n, ok := n.(*rocketpoolNotification)
+		if !ok {
+			logger.Errorf("Sync committee notification not of type rocketpoolNotification")
+			return ""
+		}
+		extras := strings.Split(n.ExtraData, "|")
+		if len(extras) != 3 {
+			logger.Errorf("Invalid number of arguments passed to sync committee extra data. Notification will not be sent until code is corrected.")
+			return ""
+		}
+
+		validators = append(validators, extras[0])
+		if i == 0 {
+			// startEpoch, endEpoch and inTime must be the same for all validators
+			startEpoch = extras[1]
+			endEpoch = extras[2]
+
+			syncStartEpoch, err := strconv.ParseUint(startEpoch, 10, 64)
+			if err != nil {
+				inTime = time.Duration(utils.Day)
+			} else {
+				inTime = time.Until(utils.EpochToTime(syncStartEpoch))
+			}
+			inTime = inTime.Round(time.Second)
+		}
+	}
+
+	if len(validators) > 0 {
+		validatorsInfo := ""
+		if len(validators) == 1 {
+			validatorsInfo = fmt.Sprintf(`Your validator %s has been elected to be part of the next sync committee.`, validators[0])
+		} else {
+			validatorsText := ""
+			for i, validator := range validators {
+				if i < len(validators)-1 {
+					validatorsText += fmt.Sprintf("%s, ", validator)
+				} else {
+					validatorsText += fmt.Sprintf("and %s", validator)
+				}
+			}
+			validatorsInfo = fmt.Sprintf(`Your validators %s have been elected to be part of the next sync committee.`, validatorsText)
+		}
+		return fmt.Sprintf(`%s The additional duties start at epoch %s, which is in %s and will last for about a day until epoch %s.`, validatorsInfo, startEpoch, inTime, endEpoch)
+	}
+
+	return ""
 }

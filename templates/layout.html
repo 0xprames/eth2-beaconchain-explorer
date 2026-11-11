@@ -4,7 +4,7 @@
     <head>
       <meta charset="utf-8" />
       <meta name="viewport" content="width=device-width,initial-scale=1.0" />
-      <meta name="keywords" content="config.Frontend.Keywords" />
+      <meta name="keywords" content="{{ config.Frontend.Keywords }}" />
       <meta name="description" content="{{ .Meta.Description }}" />
       <meta property="og:title" content="{{ .Meta.Title }}" />
       <meta property="og:type" content="website" />
@@ -14,7 +14,7 @@
       <meta property="og:url" content="https://beaconcha.in{{ .Meta.Path }}" />
       <meta property="og:site_name" content="beaconcha.in" />
       <meta name="twitter:card" content="summary" />
-      <meta name="twitter:site" content="@etherchain_org" />
+      <meta name="twitter:site" content="@beaconcha_in" />
       <meta name="twitter:title" content="{{ .Meta.Title }}" />
       <meta property="twitter:description" content="{{ .Meta.Description }}" />
       <meta property="twitter:image" content="https://beaconcha.in/img/logo.png" />
@@ -317,7 +317,7 @@
           </div>
           <div class="text-center row justify-content-center">
             <div class="col-12">
-              <span>© bitfly gmbh {{ .Year }} | {{ .Version }} |</span>
+              <span>© bitfly explorer GmbH {{ .Year }} | {{ .Version }} |</span>
               <div class="theme-switch-wrapper">
                 <label class="theme-switch" for="toggleSwitch">
                   <input type="checkbox" id="toggleSwitch" />
@@ -412,6 +412,27 @@
       <script src="/js/clipboard.min.js"></script>
       <script src="/js/requestInterval.js"></script>
 
+      <!-- Tippy.js for interactive tooltips on this page -->
+      <script src="https://unpkg.com/@popperjs/core@2/dist/umd/popper.min.js"></script>
+      <script src="https://unpkg.com/tippy.js@6/dist/tippy-bundle.umd.min.js"></script>
+      <script>
+        document.addEventListener("DOMContentLoaded", function () {
+          if (typeof tippy === "function") {
+            // Initialize existing attribute-based tooltips that already provide HTML-safe strings
+            tippy(document.querySelectorAll("[data-tippy-content]"), {
+              allowHTML: true,
+              interactive: true,
+              theme: "bcx",
+              appendTo: document.body,
+              maxWidth: 380,
+              delay: [150, 200],
+              placement: "top",
+              interactiveBorder: 8,
+              arrow: true,
+            })
+          }
+        })
+      </script>
       {{ template "js" .Data }}
       {{ if not .Meta.NoTrack }}
         {{ if ne .Meta.GATag "" }}

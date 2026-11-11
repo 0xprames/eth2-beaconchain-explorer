@@ -2,12 +2,13 @@ package price
 
 import (
 	"context"
-	"eth2-exporter/contracts/chainlink_feed"
 	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
+
+	"github.com/gobitfly/eth2-beaconchain-explorer/contracts/chainlink_feed"
 
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
 	"github.com/ethereum/go-ethereum/common"
@@ -220,6 +221,9 @@ func setPrice(a, b string, v float64) {
 }
 
 func GetPrice(a, b string) float64 {
+	if didInit < 1 {
+		logger.Fatal("using GetPrice without calling price.Init once")
+	}
 	runOnceWg.Wait()
 	pricesMu.Lock()
 	defer pricesMu.Unlock()

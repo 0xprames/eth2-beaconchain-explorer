@@ -3,13 +3,14 @@ package mail
 import (
 	"bytes"
 	"context"
-	"eth2-exporter/db"
-	"eth2-exporter/templates"
-	"eth2-exporter/types"
-	"eth2-exporter/utils"
 	"fmt"
 	"net/smtp"
 	"time"
+
+	"github.com/gobitfly/eth2-beaconchain-explorer/db"
+	"github.com/gobitfly/eth2-beaconchain-explorer/templates"
+	"github.com/gobitfly/eth2-beaconchain-explorer/types"
+	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
 
 	"github.com/mailgun/mailgun-go/v4"
 	"github.com/sirupsen/logrus"
@@ -90,7 +91,7 @@ func SendMailRateLimited(to, subject string, msg types.Email, attachment []types
 			return err
 		}
 		if count >= utils.Config.Frontend.MaxMailsPerEmailPerDay {
-			timeLeft := now.Add(time.Hour * 24).Truncate(time.Hour * 24).Sub(now)
+			timeLeft := now.Add(utils.Day).Truncate(utils.Day).Sub(now)
 			return &types.RateLimitError{TimeLeft: timeLeft}
 		}
 	}
@@ -131,6 +132,9 @@ func SendMailMailgun(to, subject, msgHtml, msgText string, attachment []types.Em
 		utils.Config.Frontend.Mail.Mailgun.Domain,
 		utils.Config.Frontend.Mail.Mailgun.PrivateKey,
 	)
+	if utils.Config.Frontend.Mail.Mailgun.UseEUAPI {
+		mg.SetAPIBase(mailgun.APIBaseEU)
+	}
 	message := mg.NewMessage(utils.Config.Frontend.Mail.Mailgun.Sender, subject, msgText, to)
 	message.SetHtml(msgHtml)
 
@@ -202,6 +206,9 @@ func SendTextMailMailgun(to, subject, msg string, attachment []types.EmailAttach
 		utils.Config.Frontend.Mail.Mailgun.Domain,
 		utils.Config.Frontend.Mail.Mailgun.PrivateKey,
 	)
+	if utils.Config.Frontend.Mail.Mailgun.UseEUAPI {
+		mg.SetAPIBase(mailgun.APIBaseEU)
+	}
 	message := mg.NewMessage(utils.Config.Frontend.Mail.Mailgun.Sender, subject, msg, to)
 
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)

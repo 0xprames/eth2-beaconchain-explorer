@@ -3,14 +3,17 @@ package cache
 import (
 	"context"
 	"encoding/json"
-	"eth2-exporter/utils"
 	"fmt"
 	"strconv"
 	"time"
 
+	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
+
 	"github.com/coocood/freecache"
 	"github.com/sirupsen/logrus"
 )
+
+var _ TieredCacher = (*tieredCache)(nil)
 
 // Tiered cache is a cache implementation combining a
 type tieredCache struct {
@@ -30,7 +33,19 @@ type RemoteCache interface {
 	GetBool(ctx context.Context, key string) (bool, error)
 }
 
-var TieredCache *tieredCache
+type TieredCacher interface {
+	Set(key string, value interface{}, expiration time.Duration) error
+	SetString(key string, value string, expiration time.Duration) error
+	SetUint64(key string, value uint64, expiration time.Duration) error
+	SetBool(key string, value bool, expiration time.Duration) error
+
+	GetStringWithLocalTimeout(key string, localExpiration time.Duration) (string, error)
+	GetUint64WithLocalTimeout(key string, localExpiration time.Duration) (uint64, error)
+	GetBoolWithLocalTimeout(key string, localExpiration time.Duration) (bool, error)
+	GetWithLocalTimeout(key string, localExpiration time.Duration, returnValue interface{}) (interface{}, error)
+}
+
+var TieredCache TieredCacher
 
 func MustInitTieredCache(redisAddress string) {
 	ctx, cancel := context.WithTimeout(context.Background(), time.Second*30)

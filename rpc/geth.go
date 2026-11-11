@@ -3,13 +3,14 @@ package rpc
 import (
 	"context"
 	"encoding/hex"
-	"eth2-exporter/contracts/oneinchoracle"
-	"eth2-exporter/erc20"
-	"eth2-exporter/types"
 	"fmt"
 	"math/big"
 	"strings"
 	"time"
+
+	"github.com/gobitfly/eth2-beaconchain-explorer/contracts/oneinchoracle"
+	"github.com/gobitfly/eth2-beaconchain-explorer/erc20"
+	"github.com/gobitfly/eth2-beaconchain-explorer/types"
 
 	"github.com/ethereum/go-ethereum"
 	"github.com/ethereum/go-ethereum/accounts/abi/bind"
@@ -154,7 +155,7 @@ func (client *GethClient) GetBlock(number int64) (*types.Eth1Block, *types.GetBl
 	for _, tx := range txs {
 
 		var from []byte
-		sender, err := geth_types.Sender(geth_types.NewCancunSigner(tx.ChainId()), tx)
+		sender, err := geth_types.Sender(geth_types.NewPragueSigner(tx.ChainId()), tx)
 		if err != nil {
 			from, _ = hex.DecodeString("abababababababababababababababababababab")
 			logrus.Errorf("error converting tx %v to msg: %v", tx.Hash(), err)

@@ -354,8 +354,21 @@
                             {{ if eq .Premium.Package "goldfish" }}
                               <strong style="color: #d89a3e; font-size: 1.1em">Goldfish </strong>
                             {{ else }}
-                              {{ if eq .Premium.Package "whale" }}<strong style="color: #44a1c5; font-size: 1.1em">Whale </strong>{{ end }}
-
+                              {{ if eq .Premium.Package "whale" }}
+                                <strong style="color: #44a1c5; font-size: 1.1em">Whale </strong>
+                              {{ else }}
+                                {{ if or (eq .Premium.Package "guppy") (eq .Premium.Package "guppy.yearly") }}
+                                  <strong style="color: #50c878; font-size: 1.1em">Guppy {{ if eq .Premium.Package "guppy.yearly" }}(yearly){{ end }} </strong>
+                                {{ else }}
+                                  {{ if or (eq .Premium.Package "dolphin") (eq .Premium.Package "dolphin.yearly") }}
+                                    <strong style="color: #d89a3e; font-size: 1.1em">Dolphin {{ if eq .Premium.Package "dolphin.yearly" }}(yearly){{ end }} </strong>
+                                  {{ else }}
+                                    {{ if or (eq .Premium.Package "orca") (eq .Premium.Package "orca.yearly") }}
+                                      <strong style="color: #44a1c5; font-size: 1.1em">Orca {{ if eq .Premium.Package "orca.yearly" }}(yearly){{ end }} </strong>
+                                    {{ end }}
+                                  {{ end }}
+                                {{ end }}
+                              {{ end }}
                             {{ end }}
                           {{ end }}
                         {{ end }}
@@ -402,14 +415,14 @@
                     <form id="email-form" action="settings/email" method="POST">
                       {{ .CsrfField }}
                       <div class="form-group">
-                        <label for="email">Email address</label>
-                        <div class="input-group">
-                          <input value="{{ .Subscription.Email }}" disabled inputmode="email" type="text" maxlength="100" class="form-control" autocomplete="email" id="email" name="email" />
-                          <div class="input-group-append">
-                            <button id="email-edit-button" onclick="toggleButton(this)" type="button" class="btn btn-outline-primary">Edit</button>
-                          </div>
-                        </div>
+                        <label for="current-password">Confirm Current Password</label>
+                        <input required type="password" minlength="5" maxlength="256" class="form-control" autocomplete="current-password" id="current-password" name="current-password" />
                       </div>
+                      <div class="form-group">
+                        <label for="email">New Email Address</label>
+                        <input required value="{{ .Subscription.Email }}" inputmode="email" type="text" maxlength="100" class="form-control" autocomplete="email" id="email" name="email" />
+                      </div>
+                      <button type="submit" class="btn btn-outline-primary float-right">Change Email</button>
                     </form>
                   </div>
                 </div>
@@ -447,9 +460,13 @@
                   </div>
                   <div class="card-body">
                     <div class="d-flex justify-content-between">
-                      <span> Warning, you will not be able to recover your account! </span>
-                      <!-- Button trigger modal -->
-                      <button type="button" class="btn btn-sm btn-outline-danger" data-toggle="modal" data-target="#deleteAccountModal">Delete</button>
+                      {{ if .IsUserDeleteDisabled }}
+                        <span> You currently have an active premium subscription or premium API plan. To delete your account please cancel your subscription or contact our <a href="https://dsc.gg/beaconchain">support</a> </span>
+                      {{ else }}
+                        <span> Warning, you will not be able to recover your account! </span>
+                        <!-- Button trigger modal -->
+                        <button type="button" class="btn btn-sm btn-outline-danger" data-toggle="modal" data-target="#deleteAccountModal">Delete</button>
+                      {{ end }}
                     </div>
                   </div>
                 </div>
@@ -787,7 +804,6 @@
                               Emerald <i style="color: #50c878;" class="fas fa-gem"></i>
                             {{ else }}
                               {{ if eqsp .Subscription.PriceID .Diamond }}Diamond <i style="color: #b9f2ff" class="fas fa-gem"></i>{{ end }}
-
                             {{ end }}
                           {{ end }}
                         {{ end }}
@@ -813,11 +829,32 @@
                             <i class="fas fa-key"></i>
                           </span>
                           <span style="font-size: 90%;">
-                            <span style="user-select: all;">{{ .Subscription.ApiKey }}</span>
+                            <span id="user-api-key" style="user-select: all;" data-api-key="{{ .Subscription.ApiKey }}"> <span class="api-key-start" style="user-select: all;"></span><span class="api-key-middle" style="user-select: all; filter: blur(4px);"></span><span class="api-key-end" style="user-select: all;"></span> </span>
                             <a style="color: #fff" id="copy-apiKey" data-toggle="tooltip" data-original-title="Copy API Key" data-clipboard-text="{{ .Subscription.ApiKey }}" class="btn btn-primary mb-1 btn-icon-inside">
                               <span class="fa fa-copy icon-inside text-white"></span>
                             </a>
                           </span>
+                          <script>
+                            ;(function () {
+                              var container = document.getElementById("user-api-key")
+                              if (!container) {
+                                return
+                              }
+                              var key = container.getAttribute("data-api-key") || ""
+                              if (!key) {
+                                return
+                              }
+                              var start = key.slice(0, 4)
+                              var end = key.slice(-4)
+                              var middle = key.slice(4, Math.max(4, key.length - 4))
+                              var startEl = container.querySelector(".api-key-start")
+                              var midEl = container.querySelector(".api-key-middle")
+                              var endEl = container.querySelector(".api-key-end")
+                              if (startEl) startEl.textContent = start
+                              if (midEl) midEl.textContent = middle
+                              if (endEl) endEl.textContent = end
+                            })()
+                          </script>
                         </div>
                       {{ else }}
                         <div class="my-2">
@@ -835,7 +872,7 @@
                     <div class="card-header justify-content-between d-flex align-items-center">
                       <h3 class="h5">
                         <span
-                          >Usage <span class="mx-1">|</span> <a style="font-size: 80%;" class="font-weight-light" href="/api/v1/docs/index.html">docs <i style="font-size: 80%;" class="fas fa-laptop-code"></i></a
+                          >Usage <span class="mx-1">|</span> <a style="font-size: 80%;" class="font-weight-light" href="/api/v1/docs">docs <i style="font-size: 80%;" class="fas fa-laptop-code"></i></a
                         ></span>
                       </h3>
                     </div>

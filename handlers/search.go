@@ -4,15 +4,16 @@ import (
 	"database/sql"
 	"encoding/hex"
 	"encoding/json"
-	"eth2-exporter/db"
-	"eth2-exporter/templates"
-	"eth2-exporter/types"
-	"eth2-exporter/utils"
 	"fmt"
 	"net/http"
 	"regexp"
 	"strconv"
 	"strings"
+
+	"github.com/gobitfly/eth2-beaconchain-explorer/db"
+	"github.com/gobitfly/eth2-beaconchain-explorer/templates"
+	"github.com/gobitfly/eth2-beaconchain-explorer/types"
+	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
 
 	"github.com/gorilla/mux"
 	"github.com/lib/pq"
@@ -39,11 +40,12 @@ func Search(w http.ResponseWriter, r *http.Request) {
 	var ensData *types.EnsDomainResponse
 	if utils.IsValidEnsDomain(search) {
 		ensData, _ = GetEnsDomain(search)
-
 	}
 	search = strings.Replace(search, "0x", "", -1)
 	if ensData != nil && len(ensData.Address) > 0 {
 		http.Redirect(w, r, "/address/"+ensData.Domain, http.StatusMovedPermanently)
+	} else if utils.IsValidWithdrawalCredentials(search) {
+		http.Redirect(w, r, "/validators/deposits?q="+search, http.StatusMovedPermanently)
 	} else if utils.IsValidEth1Tx(search) {
 		http.Redirect(w, r, "/tx/"+search, http.StatusMovedPermanently)
 	} else if len(search) == 96 {
@@ -83,7 +85,7 @@ func SearchAhead(w http.ResponseWriter, r *http.Request) {
 
 	switch searchType {
 	case "slots":
-		if len(search) <= 1 || !searchLikeRE.MatchString(strippedSearch) {
+		if !searchLikeRE.MatchString(strippedSearch) {
 			break
 		}
 		result = &types.SearchAheadSlotsResult{}
@@ -120,18 +122,18 @@ func SearchAhead(w http.ResponseWriter, r *http.Request) {
 			break
 		}
 		result = &types.SearchAheadBlocksResult{{
-			Block: block.Number,
+			Block: fmt.Sprintf("%v", block.Number),
 			Hash:  fmt.Sprintf("%#x", block.Hash),
 		}}
 	case "graffiti":
 		graffiti := &types.SearchAheadGraffitiResult{}
 		err = db.ReaderDb.Select(graffiti, `
-			SELECT graffiti, count(*)
-			FROM blocks
-			WHERE graffiti_text ILIKE LOWER($1)
-			GROUP BY graffiti
-			ORDER BY count desc
-			LIMIT 10`, "%"+search+"%")
+			select graffiti, sum(count) as count 
+			from graffiti_stats 
+			where graffiti_text ilike lower($1) 
+			group by graffiti 
+			order by count desc 
+			limit 10`, "%"+search+"%")
 		if err != nil {
 			break
 		}
@@ -174,10 +176,8 @@ func SearchAhead(w http.ResponseWriter, r *http.Request) {
 		} else {
 			err = db.ReaderDb.Select(result, `
 			SELECT validatorindex AS index, pubkeyhex AS pubkey
-			FROM validators
-			LEFT JOIN validator_names ON validators.pubkey = validator_names.publickey
-			WHERE LOWER(validator_names.name) LIKE LOWER($1)
-			ORDER BY index LIMIT 10`, search+"%")
+			FROM validators WHERE pubkey IN 
+				(SELECT publickey FROM validator_names WHERE LOWER(validator_names.name) LIKE LOWER($1) LIMIT 10)`, search+"%")
 		}
 	case "eth1_addresses":
 		if utils.IsValidEnsDomain(search) {
@@ -206,7 +206,6 @@ func SearchAhead(w http.ResponseWriter, r *http.Request) {
 			err = fmt.Errorf("error searching for eth1AddressHash: %v", err)
 		}
 	case "indexed_validators":
-
 		// find all validators that have a publickey or index like the search-query
 		result = &types.SearchAheadValidatorsResult{}
 		indexNumeric, errParse := strconv.ParseInt(search, 10, 32)
@@ -215,12 +214,9 @@ func SearchAhead(w http.ResponseWriter, r *http.Request) {
 		} else if thresholdHexLikeRE.MatchString(lowerStrippedSearch) {
 			err = db.ReaderDb.Select(result, `SELECT validatorindex AS index, pubkeyhex as pubkey FROM validators WHERE pubkeyhex LIKE ($1 || '%')`, lowerStrippedSearch)
 		} else {
-			err = db.ReaderDb.Select(result, `
-			SELECT validatorindex AS index, pubkeyhex AS pubkey
-			FROM validators
-			LEFT JOIN validator_names ON validators.pubkey = validator_names.publickey
-			WHERE LOWER(validator_names.name) LIKE LOWER($1)
-			ORDER BY index LIMIT 10`, search+"%")
+			err = db.ReaderDb.Select(result, `SELECT validatorindex AS index, pubkeyhex AS pubkey
+			FROM validators WHERE pubkey IN 
+				(SELECT publickey FROM validator_names WHERE LOWER(validator_names.name) LIKE LOWER($1) LIMIT 10)`, search+"%")
 		}
 	case "validators_by_pubkey":
 		if !thresholdHexLikeRE.MatchString(lowerStrippedSearch) {
@@ -251,7 +247,7 @@ func SearchAhead(w http.ResponseWriter, r *http.Request) {
 		if !searchLikeRE.MatchString(lowerStrippedSearch) {
 			break
 		}
-		// find validators per eth1-address (limit result by N addresses and M validators per address)
+		// find validators per eth1-address
 		result = &[]struct {
 			Eth1Address string `db:"from_address_text" json:"eth1_address"`
 			Count       uint64 `db:"count" json:"count"`
@@ -267,7 +263,71 @@ func SearchAhead(w http.ResponseWriter, r *http.Request) {
 				WHERE from_address_text LIKE $1 || '%'
 			) a 
 			GROUP BY from_address_text`, lowerStrippedSearch)
+	case "count_indexed_validators_by_withdrawal_credential":
+		var ensData *types.EnsDomainResponse
+		if utils.IsValidEnsDomain(search) {
+			ensData, _ = GetEnsDomain(search)
+			if len(ensData.Address) > 0 {
+				lowerStrippedSearch = strings.ToLower(strings.Replace(ensData.Address, "0x", "", -1))
+			}
+		}
+		var candidateCreds []string
+		if len(lowerStrippedSearch) == 40 {
+			// when the user gives an address (that validators might withdraw to) we transform the address into credentials
+			// We don't know if the address corresponds to a 0x01 or 0x02 withdrawal credentials, so we check both.
+			cred1 := utils.BeginningOfSetWithdrawalCredentials(1) + lowerStrippedSearch
+			cred2 := utils.BeginningOfSetWithdrawalCredentials(2) + lowerStrippedSearch
 
+			if utils.IsValidWithdrawalCredentials(cred1) {
+				candidateCreds = append(candidateCreds, cred1)
+			}
+			if utils.IsValidWithdrawalCredentials(cred2) {
+				candidateCreds = append(candidateCreds, cred2)
+			}
+		} else if utils.IsValidWithdrawalCredentials(lowerStrippedSearch) { // Otherwise, assume the user supplied the full withdrawal credentials.
+			candidateCreds = append(candidateCreds, lowerStrippedSearch)
+		}
+
+		if len(candidateCreds) == 0 {
+			break
+		}
+
+		var decodedCreds [][]byte
+		for _, cred := range candidateCreds {
+			decoded, decodeErr := hex.DecodeString(cred)
+			if decodeErr != nil {
+				continue
+			}
+			decodedCreds = append(decodedCreds, decoded)
+		}
+
+		if len(decodedCreds) == 0 {
+			break
+		}
+		// find validators per withdrawal credential
+		dbFinding := []struct {
+			DecodedCredential []byte `db:"withdrawalcredentials"`
+			Count             uint64 `db:"count"`
+		}{}
+		err = db.ReaderDb.Select(&dbFinding, `
+				SELECT withdrawalcredentials, COUNT(*) 
+				FROM validators 
+				WHERE withdrawalcredentials = ANY($1) 
+				GROUP BY withdrawalcredentials`,
+			pq.ByteaArray(decodedCreds),
+		)
+		if err == nil {
+			res := make([]struct {
+				EncodedCredential string `json:"withdrawalcredentials"`
+				Count             uint64 `json:"count"`
+			},
+				len(dbFinding))
+			for i := range dbFinding {
+				res[i].EncodedCredential = fmt.Sprintf("%x", dbFinding[i].DecodedCredential)
+				res[i].Count = dbFinding[i].Count
+			}
+			result = &res
+		}
 	case "indexed_validators_by_graffiti":
 		// find validators per graffiti (limit result by N graffities and M validators per graffiti)
 		res := []struct {
@@ -276,19 +336,21 @@ func SearchAhead(w http.ResponseWriter, r *http.Request) {
 			Count            uint64        `db:"count" json:"-"`
 		}{}
 		err = db.ReaderDb.Select(&res, `
+			WITH 
+				graffiti_days AS (SELECT day FROM (SELECT day FROM graffiti_stats WHERE graffiti_text ILIKE LOWER($1) ORDER BY DAY DESC LIMIT $2) a GROUP BY day),
+				graffiti_blocks AS (SELECT proposer, graffiti FROM blocks INNER JOIN graffiti_days ON blocks.epoch >= graffiti_days.day*$3 AND blocks.epoch < graffiti_days.day*$3+$3 WHERE blocks.graffiti_text ILIKE LOWER($1) ORDER BY slot DESC LIMIT $2)
 			SELECT graffiti, COUNT(*), ARRAY_AGG(validatorindex) validatorindices FROM (
 				SELECT 
 					DISTINCT ON(validatorindex) validatorindex,
 					graffiti,
 					DENSE_RANK() OVER(PARTITION BY graffiti ORDER BY validatorindex) AS validatorrow,
 					DENSE_RANK() OVER(ORDER BY graffiti) AS graffitirow
-				FROM blocks 
-				LEFT JOIN validators ON blocks.proposer = validators.validatorindex
-				WHERE graffiti_text ILIKE LOWER($1)
+				FROM graffiti_blocks 
+				LEFT JOIN validators ON graffiti_blocks.proposer = validators.validatorindex
 			) a 
 			WHERE validatorrow <= $2 AND graffitirow <= 10
 			GROUP BY graffiti
-			ORDER BY count DESC`, "%"+search+"%", searchValidatorsResultLimit)
+			ORDER BY count DESC`, "%"+search+"%", searchValidatorsResultLimit, utils.EpochsPerDay())
 		if err != nil {
 			break
 		}
@@ -353,7 +415,7 @@ func SearchAhead(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-// search can ether be a valid ETH address or an ENS name mapping to one
+// search can either be a valid ETH address or an ENS name mapping to one
 func FindValidatorIndicesByEth1Address(search string) (types.SearchValidatorsByEth1Result, error) {
 	search = strings.ToLower(strings.Replace(ReplaceEnsNameWithAddress(search), "0x", "", -1))
 	if !utils.IsValidEth1Address(search) {

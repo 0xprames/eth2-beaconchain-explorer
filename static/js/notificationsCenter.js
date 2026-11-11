@@ -309,6 +309,7 @@ function loadMonitoringData(data) {
     stateLoadCallback: function (settings) {
       return JSON.parse(localStorage.getItem("DataTables_" + settings.sInstance))
     },
+    searchDelay: 0,
     processing: true,
     responsive: true,
     scroller: true,
@@ -481,6 +482,7 @@ function loadNetworkData(data) {
     stateLoadCallback: function (settings) {
       return JSON.parse(localStorage.getItem("DataTables_" + settings.sInstance))
     },
+    searchDelay: 0,
     processing: true,
     responsive: false,
     scroller: true,
@@ -587,6 +589,7 @@ function loadValidatorsData(data) {
     stateLoadCallback: function (settings) {
       return JSON.parse(localStorage.getItem("DataTables_" + settings.sInstance))
     },
+    searchDelay: 0,
     processing: true,
     // responsive: true,
     paging: true,
@@ -641,7 +644,7 @@ function loadValidatorsData(data) {
             return row.Index
           }
           let datahref = `/validator/${row.Index || row.Pubkey}`
-          return `<div class="d-flex align-items-center"><i style="flex 0 0 1rem" class="fas fa-male mr-2"></i><a style="flex: 1 1;" class="font-weight-bold no-highlight mx-2 d-flex flex-wrap" href=${datahref}><span>` + row.Index + `</span><span style="flex-basis: 100%;" class="heading-l4 d-none d-sm-inline-flex">0x` + row.Pubkey.substring(0, 6) + ` ...</span></a><span style="flex: 1 1 0;"></span><i style="flex: 0 0 1rem;" class="fa fa-copy text-muted d-none d-sm-inline p-1" role="button" data-toggle="tooltip" title="Copy to clipboard" data-clipboard-text="0x${row.Pubkey}"></i></div>`
+          return `<div class="d-flex align-items-center"><i style="flex 0 0 1rem" class="fas fa-user-shield mr-2"></i><a style="flex: 1 1;" class="font-weight-bold no-highlight mx-2 d-flex flex-wrap" href=${datahref}><span>` + row.Index + `</span><span style="flex-basis: 100%;" class="heading-l4 d-none d-sm-inline-flex">0x` + row.Pubkey.substring(0, 6) + ` ...</span></a><span style="flex: 1 1 0;"></span><i style="flex: 0 0 1rem;" class="fa fa-copy text-muted d-none d-sm-inline p-1" role="button" data-toggle="tooltip" title="Copy to clipboard" data-clipboard-text="0x${row.Pubkey}"></i></div>`
         },
       },
       {

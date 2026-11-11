@@ -1,17 +1,20 @@
 package handlers
 
 import (
-	"eth2-exporter/templates"
-	"eth2-exporter/utils"
 	"html/template"
 	"net/http"
+
+	"github.com/gobitfly/eth2-beaconchain-explorer/templates"
+	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
 )
+
+var imprintTemplate *template.Template
 
 // Imprint will show the imprint data using a go template
 func Imprint(w http.ResponseWriter, r *http.Request) {
-
-	imprintTemplate := templates.GetTemplate(layoutTemplateFiles...)
-	imprintTemplate = template.Must(imprintTemplate.Parse(utils.Config.Frontend.Legal.ImprintTemplate))
+	if imprintTemplate == nil {
+		imprintTemplate = template.Must(template.Must(templates.GetTemplate(layoutTemplateFiles...).Clone()).Parse(utils.Config.Frontend.Legal.ImprintTemplate))
+	}
 	w.Header().Set("Content-Type", "text/html")
 
 	data := InitPageData(w, r, "imprint", "/imprint", "Imprint", layoutTemplateFiles)

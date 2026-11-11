@@ -20,6 +20,7 @@ docker-compose-private.yml
 static/bundle/css
 static/bundle/js
 docs
+static/swagger
 node_modules
 .vscode
 webassembly
@@ -30,3 +31,7 @@ cmd/forkwatch
 **/.DS_Store
 _gitignore/
 local-deployment/config.yml
+local-deployment/elconfig.json
+local-deployment/.env
+__gitignore
+cmd/validator-tagger/*.csv

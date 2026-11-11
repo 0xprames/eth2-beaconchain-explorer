@@ -3,17 +3,18 @@ package db
 import (
 	"context"
 	"database/sql"
-	"eth2-exporter/cache"
-	"eth2-exporter/metrics"
-	"eth2-exporter/price"
-	"eth2-exporter/rpc"
-	"eth2-exporter/types"
-	"eth2-exporter/utils"
 	"fmt"
 	"math/big"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/gobitfly/eth2-beaconchain-explorer/cache"
+	"github.com/gobitfly/eth2-beaconchain-explorer/metrics"
+	"github.com/gobitfly/eth2-beaconchain-explorer/price"
+	"github.com/gobitfly/eth2-beaconchain-explorer/rpc"
+	"github.com/gobitfly/eth2-beaconchain-explorer/types"
+	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/jackc/pgx/v5"
@@ -36,7 +37,7 @@ func WriteValidatorStatisticsForDay(day uint64, client rpc.Client) error {
 
 	logger.Infof("exporting statistics for day %v (epoch %v to %v)", day, firstEpoch, lastEpoch)
 
-	if err := checkIfDayIsFinalized(day); err != nil {
+	if err := CheckIfDayIsFinalized(day); err != nil {
 		return err
 	}
 
@@ -78,19 +79,20 @@ func WriteValidatorStatisticsForDay(day uint64, client rpc.Client) error {
 		return fmt.Errorf("cannot export day %v as day %v has not yet been exported yet", day, int64(day)-1)
 	}
 
-	maxValidatorIndex, err := BigtableClient.GetMaxValidatorindexForEpoch(lastEpoch)
+	state, err := client.GetValidatorState(lastEpoch)
 	if err != nil {
-		return err
+		return fmt.Errorf("error retrieving validator state for epoch %v: %w", lastEpoch, err)
 	}
-	validators := make([]uint64, 0, maxValidatorIndex)
-	validatorData := make([]*types.ValidatorStatsTableDbRow, 0, maxValidatorIndex)
+
+	validators := make([]uint64, 0, len(state.Data))
+	validatorData := make([]*types.ValidatorStatsTableDbRow, 0, len(state.Data))
 	validatorDataMux := &sync.Mutex{}
 
-	logger.Infof("processing statistics for validators 0-%d", maxValidatorIndex)
-	for i := uint64(0); i <= maxValidatorIndex; i++ {
-		validators = append(validators, i)
+	logger.Infof("processing statistics for validators 0-%d", len(state.Data))
+	for i := 0; i < len(state.Data); i++ {
+		validators = append(validators, uint64(state.Data[i].Index))
 		validatorData = append(validatorData, &types.ValidatorStatsTableDbRow{
-			ValidatorIndex: i,
+			ValidatorIndex: uint64(state.Data[i].Index),
 			Day:            int64(day),
 		})
 	}
@@ -105,7 +107,7 @@ func WriteValidatorStatisticsForDay(day uint64, client rpc.Client) error {
 		return nil
 	})
 	g.Go(func() error {
-		if err := gatherValidatorSyncDutiesForDay(validators, day, validatorData, validatorDataMux); err != nil {
+		if err := GatherValidatorSyncDutiesForDay(validators, day, validatorData, validatorDataMux); err != nil {
 			return fmt.Errorf("error in GatherValidatorSyncDutiesForDay: %w", err)
 		}
 		return nil
@@ -138,7 +140,7 @@ func WriteValidatorStatisticsForDay(day uint64, client rpc.Client) error {
 	var statisticsData1d []*types.ValidatorStatsTableDbRow
 	g.Go(func() error {
 		var err error
-		statisticsData1d, err = gatherStatisticsForDay(int64(day) - 1) // convert to int64 to avoid underflows
+		statisticsData1d, err = GatherStatisticsForDay(int64(day) - 1) // convert to int64 to avoid underflows
 		if err != nil {
 			return fmt.Errorf("error in GatherPreviousDayStatisticsData: %w", err)
 		}
@@ -147,7 +149,7 @@ func WriteValidatorStatisticsForDay(day uint64, client rpc.Client) error {
 	var statisticsData7d []*types.ValidatorStatsTableDbRow
 	g.Go(func() error {
 		var err error
-		statisticsData7d, err = gatherStatisticsForDay(int64(day) - 7) // convert to int64 to avoid underflows
+		statisticsData7d, err = GatherStatisticsForDay(int64(day) - 7) // convert to int64 to avoid underflows
 		if err != nil {
 			return fmt.Errorf("error in GatherPreviousDayStatisticsData: %w", err)
 		}
@@ -156,7 +158,7 @@ func WriteValidatorStatisticsForDay(day uint64, client rpc.Client) error {
 	var statisticsData31d []*types.ValidatorStatsTableDbRow
 	g.Go(func() error {
 		var err error
-		statisticsData31d, err = gatherStatisticsForDay(int64(day) - 31) // convert to int64 to avoid underflows
+		statisticsData31d, err = GatherStatisticsForDay(int64(day) - 31) // convert to int64 to avoid underflows
 		if err != nil {
 			return fmt.Errorf("error in GatherPreviousDayStatisticsData: %w", err)
 		}
@@ -165,7 +167,7 @@ func WriteValidatorStatisticsForDay(day uint64, client rpc.Client) error {
 	var statisticsData365d []*types.ValidatorStatsTableDbRow
 	g.Go(func() error {
 		var err error
-		statisticsData31d, err = gatherStatisticsForDay(int64(day) - 365) // convert to int64 to avoid underflows
+		statisticsData365d, err = GatherStatisticsForDay(int64(day) - 365) // convert to int64 to avoid underflows
 		if err != nil {
 			return fmt.Errorf("error in GatherPreviousDayStatisticsData: %w", err)
 		}
@@ -211,6 +213,14 @@ func WriteValidatorStatisticsForDay(day uint64, client rpc.Client) error {
 
 		// update mev reward total
 		data.MEVRewardsWeiTotal = previousDayData.MEVRewardsWeiTotal.Add(data.MEVRewardsWei)
+
+		// update withdrawal total
+		data.WithdrawalsTotal = previousDayData.WithdrawalsTotal + data.Withdrawals
+		data.WithdrawalsAmountTotal = previousDayData.WithdrawalsAmountTotal + data.WithdrawalsAmount
+
+		// update deposits total
+		data.DepositsTotal = previousDayData.DepositsTotal + data.Deposits
+		data.DepositsAmountTotal = previousDayData.DepositsAmountTotal + data.DepositsAmount
 
 		if statisticsData1d != nil && len(statisticsData1d) > index {
 			data.ClPerformance1d = data.ClRewardsGWeiTotal - statisticsData1d[index].ClRewardsGWeiTotal
@@ -300,9 +310,13 @@ func WriteValidatorStatisticsForDay(day uint64, client rpc.Client) error {
 			"attester_slashings",
 			"proposer_slashings",
 			"deposits",
+			"deposits_total",
 			"deposits_amount",
+			"deposits_amount_total",
 			"withdrawals",
+			"withdrawals_total",
 			"withdrawals_amount",
+			"withdrawals_amount_total",
 			"cl_rewards_gwei",
 			"cl_rewards_gwei_total",
 			"el_rewards_wei",
@@ -336,9 +350,13 @@ func WriteValidatorStatisticsForDay(day uint64, client rpc.Client) error {
 				validatorData[i].AttesterSlashings,
 				validatorData[i].ProposerSlashing,
 				validatorData[i].Deposits,
+				validatorData[i].DepositsTotal,
 				validatorData[i].DepositsAmount,
+				validatorData[i].DepositsAmountTotal,
 				validatorData[i].Withdrawals,
+				validatorData[i].WithdrawalsTotal,
 				validatorData[i].WithdrawalsAmount,
+				validatorData[i].WithdrawalsAmountTotal,
 				validatorData[i].ClRewardsGWei,
 				validatorData[i].ClRewardsGWeiTotal,
 				validatorData[i].ElRewardsWei,
@@ -822,25 +840,10 @@ func gatherValidatorDepositWithdrawals(day uint64, data []*types.ValidatorStatsT
 
 	logger.Infof("gathering deposits + withdrawals")
 
-	type resRowDeposits struct {
-		ValidatorIndex uint64 `db:"validatorindex"`
-		Deposits       uint64 `db:"deposits"`
-		DepositsAmount uint64 `db:"deposits_amount"`
-	}
-	resDeposits := make([]*resRowDeposits, 0, 1024)
-	depositsQry := `
-			select validators.validatorindex, count(*) AS deposits, sum(amount) AS deposits_amount
-			from blocks_deposits
-			inner join validators on blocks_deposits.publickey = validators.pubkey
-			inner join blocks on blocks_deposits.block_root = blocks.blockroot
-			where blocks.slot >= $1 and blocks.slot <= $2 and (blocks.status = '1' OR blocks.slot = 0) and blocks_deposits.valid_signature
-			group by validators.validatorindex`
-
-	err := WriterDb.Select(&resDeposits, depositsQry, firstSlot, lastSlot)
+	resDeposits, err := GetValidatorDepositsAndIncomingConsolidations(&SlotRange{StartSlot: firstSlot, EndSlot: lastSlot}, nil)
 	if err != nil {
 		return fmt.Errorf("error retrieving deposits for day [%v], firstSlot [%v] and lastSlot [%v]: %w", day, firstSlot, lastSlot, err)
 	}
-
 	mux.Lock()
 	for _, r := range resDeposits {
 		data[r.ValidatorIndex].Deposits = int64(r.Deposits)
@@ -848,19 +851,7 @@ func gatherValidatorDepositWithdrawals(day uint64, data []*types.ValidatorStatsT
 	}
 	mux.Unlock()
 
-	type resRowWithdrawals struct {
-		ValidatorIndex    uint64 `db:"validatorindex"`
-		Withdrawals       uint64 `db:"withdrawals"`
-		WithdrawalsAmount uint64 `db:"withdrawals_amount"`
-	}
-	resWithdrawals := make([]*resRowWithdrawals, 0, 1024)
-
-	withdrawalsQuery := `select validatorindex, count(*) AS withdrawals, sum(amount) AS withdrawals_amount
-			from blocks_withdrawals
-			inner join blocks on blocks_withdrawals.block_root = blocks.blockroot
-			where block_slot >= $1 and block_slot <= $2 and blocks.status = '1'
-			group by validatorindex;`
-	err = WriterDb.Select(&resWithdrawals, withdrawalsQuery, firstSlot, lastSlot)
+	resWithdrawals, err := GetValidatorWithdrawalsAndOutgoingConsolidations(&SlotRange{StartSlot: firstSlot, EndSlot: lastSlot}, nil)
 	if err != nil {
 		return fmt.Errorf("error retrieving withdrawals for day [%v], firstSlot [%v] and lastSlot [%v]: %w", day, firstSlot, lastSlot, err)
 	}
@@ -876,7 +867,7 @@ func gatherValidatorDepositWithdrawals(day uint64, data []*types.ValidatorStatsT
 	return nil
 }
 
-func gatherValidatorSyncDutiesForDay(validators []uint64, day uint64, data []*types.ValidatorStatsTableDbRow, mux *sync.Mutex) error {
+func GatherValidatorSyncDutiesForDay(validators []uint64, day uint64, data []*types.ValidatorStatsTableDbRow, mux *sync.Mutex) error {
 	exportStart := time.Now()
 	defer func() {
 		metrics.TaskDuration.WithLabelValues("db_update_validator_sync_stats").Observe(time.Since(exportStart).Seconds())
@@ -890,9 +881,11 @@ func gatherValidatorSyncDutiesForDay(validators []uint64, day uint64, data []*ty
 		return nil
 	}
 	logger := logger.WithFields(logrus.Fields{
-		"day":        day,
-		"firstEpoch": firstEpoch,
-		"lastEpoch":  lastEpoch,
+		"day":         day,
+		"firstEpoch":  firstEpoch,
+		"lastEpoch":   lastEpoch,
+		"startPeriod": utils.SyncPeriodOfEpoch(firstEpoch),
+		"endPeriod":   utils.SyncPeriodOfEpoch(lastEpoch),
 	})
 	logger.Infof("gathering sync duties")
 
@@ -1058,7 +1051,8 @@ func gatherValidatorMissedAttestationsStatisticsForDay(validators []uint64, day 
 			completedEpochData := epochParticipation[completedEpoch]
 
 			if completedEpochData == nil {
-				return fmt.Errorf("logic error, did not retrieve data for epoch %v", completedEpoch)
+				logger.Errorf("logic error, did not retrieve data for epoch %v (maybe epoch had not slots)", completedEpoch)
+				continue
 			}
 
 			mux.Lock()
@@ -1097,7 +1091,7 @@ func gatherValidatorMissedAttestationsStatisticsForDay(validators []uint64, day 
 	return nil
 }
 
-func gatherStatisticsForDay(day int64) ([]*types.ValidatorStatsTableDbRow, error) {
+func GatherStatisticsForDay(day int64) ([]*types.ValidatorStatsTableDbRow, error) {
 
 	if day < 0 {
 		return nil, nil
@@ -1139,9 +1133,13 @@ func gatherStatisticsForDay(day int64) ([]*types.ValidatorStatsTableDbRow, error
 		COALESCE(attester_slashings, 0) AS attester_slashings,
 		COALESCE(proposer_slashings, 0) AS proposer_slashings,
 		COALESCE(deposits, 0) AS deposits,
+		COALESCE(deposits_total, 0) AS deposits_total,
 		COALESCE(deposits_amount, 0) AS deposits_amount,
+		COALESCE(deposits_amount_total, 0) AS deposits_amount_total,
 		COALESCE(withdrawals, 0) AS withdrawals,
+		COALESCE(withdrawals_total, 0) AS withdrawals_total,
 		COALESCE(withdrawals_amount, 0) AS withdrawals_amount,
+		COALESCE(withdrawals_amount_total, 0) AS withdrawals_amount_total,
 		COALESCE(cl_rewards_gwei, 0) AS cl_rewards_gwei,
 		COALESCE(cl_rewards_gwei_total, 0) AS cl_rewards_gwei_total,
 		COALESCE(el_rewards_wei, 0) AS el_rewards_wei,
@@ -1273,7 +1271,14 @@ func GetValidatorIncomeHistory(validatorIndices []uint64, lowerBoundDay uint64, 
 
 		var lastDeposits uint64
 		g.Go(func() error {
-			return GetValidatorDepositsForSlots(validatorIndices, firstSlot, lastSlot, &lastDeposits)
+			deposits, err := GetValidatorDepositsAndIncomingConsolidations(&SlotRange{StartSlot: firstSlot, EndSlot: lastSlot}, validatorIndices)
+			if err != nil {
+				return err
+			}
+			for _, deposit := range deposits {
+				lastDeposits += deposit.DepositsAmount
+			}
+			return nil
 		})
 
 		var lastWithdrawals uint64
@@ -1287,8 +1292,9 @@ func GetValidatorIncomeHistory(validatorIndices []uint64, lowerBoundDay uint64, 
 		}
 
 		result = append(result, types.ValidatorIncomeHistory{
-			Day:       int64(currentDay),
-			ClRewards: int64(totalBalance - lastBalance - lastDeposits + lastWithdrawals),
+			Day:        int64(currentDay),
+			ClRewards:  int64(totalBalance - lastBalance - lastDeposits + lastWithdrawals),
+			EndBalance: sql.NullInt64{Int64: int64(totalBalance), Valid: true}, // show the latest balance for todays income
 		})
 	}
 
@@ -1305,7 +1311,7 @@ func GetValidatorIncomeHistory(validatorIndices []uint64, lowerBoundDay uint64, 
 func WriteChartSeriesForDay(day int64) error {
 	startTs := time.Now()
 
-	ctx, cancel := context.WithTimeout(context.Background(), time.Second*60)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
 	defer cancel()
 	g, gCtx := errgroup.WithContext(ctx)
 
@@ -1484,7 +1490,7 @@ func WriteExecutionChartSeriesForDay(day int64) error {
 	}
 
 	if firstBlock <= 15537394 {
-		return fmt.Errorf("this function does not yet handle pre merge statistics")
+		return fmt.Errorf("this function does not yet handle pre merge statistics, firstBlock is %v, firstSlot is %v", firstBlock, firstSlot)
 	}
 
 	lastBlock, err := GetBlockNumber(uint64(lastSlot))
@@ -1523,11 +1529,15 @@ func WriteExecutionChartSeriesForDay(day int64) error {
 	totalTxSavings := decimal.NewFromInt(0)
 	totalTxFees := decimal.NewFromInt(0)
 	totalBurned := decimal.NewFromInt(0)
+	totalBurnedBlob := decimal.NewFromInt(0)
 	totalGasUsed := decimal.NewFromInt(0)
+	totalBlobGasUsed := decimal.NewFromInt(0)
+	totalBlobCount := decimal.NewFromInt(0)
 
 	legacyTxCount := int64(0)
 	accessListTxCount := int64(0)
 	eip1559TxCount := int64(0)
+	blobTxCount := int64(0)
 	failedTxCount := int64(0)
 	successTxCount := int64(0)
 
@@ -1595,8 +1605,21 @@ func WriteExecutionChartSeriesForDay(day int64) error {
 				txFees = baseFee.Mul(gasUsed).Add(tipFee.Mul(gasUsed))
 				totalTxSavings = totalTxSavings.Add(maxFee.Mul(gasUsed).Sub(baseFee.Mul(gasUsed).Add(tipFee.Mul(gasUsed))))
 
+			case 3:
+				// priority fee is capped because the base fee is filled first
+				tipFee = decimal.Min(prioFee, maxFee.Sub(baseFee))
+				blobTxCount += 1
+				// totalMinerTips = totalMinerTips.Add(tipFee.Mul(gasUsed))
+				txFees = baseFee.Mul(gasUsed).Add(tipFee.Mul(gasUsed))
+				totalTxSavings = totalTxSavings.Add(maxFee.Mul(gasUsed).Sub(baseFee.Mul(gasUsed).Add(tipFee.Mul(gasUsed))))
+
+				blobGasUsed := decimal.NewFromBigInt(new(big.Int).SetUint64(tx.BlobGasUsed), 0)
+				totalBlobGasUsed = totalBlobGasUsed.Add(blobGasUsed)
+				totalBurnedBlob = blobGasUsed.Mul(decimal.NewFromBigInt(new(big.Int).SetBytes(tx.BlobGasPrice), 0))
+				totalBlobCount = totalBlobCount.Add(decimal.NewFromInt(int64(len(tx.BlobVersionedHashes))))
+
 			default:
-				logger.Fatalf("error unknown tx type %v hash: %x", tx.Status, tx.Hash)
+				logger.Fatalf("error unknown tx type %v hash: %x", tx.Type, tx.Hash)
 			}
 			totalTxFees = totalTxFees.Add(txFees)
 
@@ -1605,13 +1628,13 @@ func WriteExecutionChartSeriesForDay(day int64) error {
 				failedTxCount += 1
 				totalFailedGasUsed = totalFailedGasUsed.Add(gasUsed)
 				totalFailedTxFee = totalFailedTxFee.Add(txFees)
-			case 1:
+			case 1, 2:
 				successTxCount += 1
 			default:
 				logger.Fatalf("error unknown status code %v hash: %x", tx.Status, tx.Hash)
 			}
 			totalGasUsed = totalGasUsed.Add(gasUsed)
-			totalBurned = totalBurned.Add(baseFee.Mul(gasUsed))
+			totalBurned = totalBurned.Add(baseFee.Mul(gasUsed)).Add(totalBurnedBlob)
 			if blk.Number < 12244000 {
 				totalTips = totalTips.Add(gasUsed.Mul(gasPrice))
 			} else {
@@ -1635,9 +1658,15 @@ func WriteExecutionChartSeriesForDay(day int64) error {
 	logger.Infof("consensus rewards: %v", totalConsensusRewards)
 
 	logger.Infof("Exporting BURNED_FEES %v", totalBurned.String())
-	_, err = WriterDb.Exec("INSERT INTO chart_series (time, indicator, value) VALUES ($1, 'BURNED_FEES', $2) on conflict (time, indicator) do update set time = excluded.time, indicator = excluded.indicator, value = excluded.value", dateTrunc, totalBurned.String())
+	err = SaveChartSeriesPoint(dateTrunc, "BURNED_FEES", totalBurned.String())
 	if err != nil {
 		return fmt.Errorf("error calculating BURNED_FEES chart_series: %w", err)
+	}
+
+	logger.Infof("Exporting BURNED_BLOB_FEES %v", totalBurnedBlob.String())
+	err = SaveChartSeriesPoint(dateTrunc, "BURNED_BLOB_FEES", totalBurnedBlob.String())
+	if err != nil {
+		return fmt.Errorf("error calculating BURNED_BLOB_FEES chart_series: %w", err)
 	}
 
 	logger.Infof("Exporting NON_FAILED_TX_GAS_USAGE %v", totalGasUsed.Sub(totalFailedGasUsed).String())
@@ -1645,10 +1674,17 @@ func WriteExecutionChartSeriesForDay(day int64) error {
 	if err != nil {
 		return fmt.Errorf("error calculating NON_FAILED_TX_GAS_USAGE chart_series: %w", err)
 	}
+
 	logger.Infof("Exporting BLOCK_COUNT %v", blockCount)
 	err = SaveChartSeriesPoint(dateTrunc, "BLOCK_COUNT", blockCount)
 	if err != nil {
 		return fmt.Errorf("error calculating BLOCK_COUNT chart_series: %w", err)
+	}
+
+	logger.Infof("Exporting BLOB_COUNT %v", blockCount)
+	err = SaveChartSeriesPoint(dateTrunc, "BLOB_COUNT", totalBlobCount)
+	if err != nil {
+		return fmt.Errorf("error calculating BLOB_COUNT chart_series: %w", err)
 	}
 
 	// convert microseconds to seconds
@@ -1675,7 +1711,7 @@ func WriteExecutionChartSeriesForDay(day int64) error {
 
 	if totalGasPrice.GreaterThan(decimal.NewFromInt(0)) && decimal.NewFromInt(legacyTxCount).Add(decimal.NewFromInt(accessListTxCount)).GreaterThan(decimal.NewFromInt(0)) {
 		logger.Infof("Exporting AVG_GASPRICE")
-		_, err = WriterDb.Exec("INSERT INTO chart_series (time, indicator, value) VALUES($1, 'AVG_GASPRICE', $2) on conflict (time, indicator) do update set time = excluded.time, indicator = excluded.indicator, value = excluded.value", dateTrunc, totalGasPrice.Div((decimal.NewFromInt(legacyTxCount).Add(decimal.NewFromInt(accessListTxCount)))).String())
+		err = SaveChartSeriesPoint(dateTrunc, "AVG_GASPRICE", totalGasPrice.Div((decimal.NewFromInt(legacyTxCount).Add(decimal.NewFromInt(accessListTxCount)))).String())
 		if err != nil {
 			return fmt.Errorf("error calculating AVG_GASPRICE chart_series err: %w", err)
 		}
@@ -1693,6 +1729,12 @@ func WriteExecutionChartSeriesForDay(day int64) error {
 	err = SaveChartSeriesPoint(dateTrunc, "TOTAL_GASUSED", totalGasUsed.String())
 	if err != nil {
 		return fmt.Errorf("error calculating TOTAL_GASUSED chart_series: %w", err)
+	}
+
+	logger.Infof("Exporting TOTAL_BLOB_GASUSED %v", totalBlobGasUsed.String())
+	err = SaveChartSeriesPoint(dateTrunc, "TOTAL_BLOB_GASUSED", totalBlobGasUsed.String())
+	if err != nil {
+		return fmt.Errorf("error calculating TOTAL_BLOB_GASUSED chart_series: %w", err)
 	}
 
 	if blockCount > 0 {
@@ -1759,9 +1801,15 @@ func WriteGraffitiStatisticsForDay(day int64) error {
 	firstSlot := uint64(day) * epochsPerDay * utils.Config.Chain.ClConfig.SlotsPerEpoch
 	firstSlotOfNextDay := uint64(day+1) * epochsPerDay * utils.Config.Chain.ClConfig.SlotsPerEpoch
 
+	tx, err := WriterDb.Beginx()
+	if err != nil {
+		return fmt.Errorf("error starting db tx in WriteGraffitiStatisticsForDay: %w", err)
+	}
+	defer tx.Rollback()
+
 	// \x are missed blocks
 	// \x0000000000000000000000000000000000000000000000000000000000000000 are empty graffities
-	_, err := WriterDb.Exec(`
+	_, err = tx.Exec(`
 		insert into graffiti_stats
 		select $1::int as day, graffiti, graffiti_text, count(*), count(distinct proposer) as proposer_count
 		from blocks 
@@ -1777,10 +1825,28 @@ func WriteGraffitiStatisticsForDay(day int64) error {
 		return err
 	}
 
+	var lastSlot uint64
+	err = tx.Get(&lastSlot, `select coalesce(max(slot),0) from blocks;`)
+	if err != nil {
+		return fmt.Errorf("error getting lastSlot in WriteGraffitiStatisticsForDay: %w", err)
+	}
+
+	// if last exported slot is younger than the last slot of the exported day then the day is completely exported
+	if day < int64(utils.DayOfSlot(lastSlot)) {
+		_, err = tx.Exec(`insert into graffiti_stats_status (day, status) values ($1, true) on conflict (day) do update set status = excluded.status`, day)
+		if err != nil {
+			return fmt.Errorf("error updating graffiti_stats_status in WriteGraffitiStatisticsForDay: %w", err)
+		}
+	}
+
+	err = tx.Commit()
+	if err != nil {
+		return fmt.Errorf("error committing db tx in WriteGraffitiStatisticsForDay: %w", err)
+	}
 	return nil
 }
 
-func checkIfDayIsFinalized(day uint64) error {
+func CheckIfDayIsFinalized(day uint64) error {
 	_, lastEpoch := utils.GetFirstAndLastEpochForDay(day)
 
 	latestFinalizedEpoch, err := GetLatestFinalizedEpoch()
@@ -1792,5 +1858,49 @@ func checkIfDayIsFinalized(day uint64) error {
 		return fmt.Errorf("delaying statistics export as not all epochs for day %v are finalized. Last epoch of the day [%v] last finalized epoch [%v]", day, lastEpoch, latestFinalizedEpoch)
 	}
 
+	return nil
+}
+
+func AggregateDeposits() error {
+	start := time.Now()
+	defer func() {
+		metrics.TaskDuration.WithLabelValues("statistics_aggregate_eth1_deposits").Observe(time.Since(start).Seconds())
+	}()
+	_, err := WriterDb.Exec(`
+		INSERT INTO eth1_deposits_aggregated (from_address, amount, validcount, invalidcount, slashedcount, totalcount, activecount, pendingcount, voluntary_exit_count)
+		SELECT
+			eth1.from_address,
+			SUM(eth1.amount) as amount,
+			SUM(eth1.validcount) AS validcount,
+			SUM(eth1.invalidcount) AS invalidcount,
+			COUNT(CASE WHEN v.status = 'slashed' THEN 1 END) AS slashedcount,
+			COUNT(v.pubkey) AS totalcount,
+			COUNT(CASE WHEN v.status = 'active_online' OR v.status = 'active_offline' THEN 1 END) as activecount,
+			COUNT(CASE WHEN v.status = 'deposited' THEN 1 END) AS pendingcount,
+			COUNT(CASE WHEN v.status = 'exited' THEN 1 END) AS voluntary_exit_count
+		FROM (
+			SELECT
+				from_address,
+				publickey,
+				SUM(amount) AS amount,
+				COUNT(CASE WHEN valid_signature = 't' THEN 1 END) AS validcount,
+				COUNT(CASE WHEN valid_signature = 'f' THEN 1 END) AS invalidcount
+			FROM eth1_deposits
+			GROUP BY from_address, publickey
+		) eth1
+		LEFT JOIN (SELECT pubkey, status FROM validators) v ON v.pubkey = eth1.publickey
+		GROUP BY eth1.from_address
+		ON CONFLICT (from_address) DO UPDATE SET
+			amount               = excluded.amount,
+			validcount           = excluded.validcount,
+			invalidcount         = excluded.invalidcount,
+			slashedcount         = excluded.slashedcount,
+			totalcount           = excluded.totalcount,
+			activecount          = excluded.activecount,
+			pendingcount         = excluded.pendingcount,
+			voluntary_exit_count = excluded.voluntary_exit_count`)
+	if err != nil && err != sql.ErrNoRows {
+		return err
+	}
 	return nil
 }

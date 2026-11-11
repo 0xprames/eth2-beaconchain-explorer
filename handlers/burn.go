@@ -2,11 +2,12 @@ package handlers
 
 import (
 	"encoding/json"
-	"eth2-exporter/price"
-	"eth2-exporter/services"
-	"eth2-exporter/templates"
-	"eth2-exporter/utils"
 	"net/http"
+
+	"github.com/gobitfly/eth2-beaconchain-explorer/price"
+	"github.com/gobitfly/eth2-beaconchain-explorer/services"
+	"github.com/gobitfly/eth2-beaconchain-explorer/templates"
+	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
 )
 
 func Burn(w http.ResponseWriter, r *http.Request) {
@@ -53,7 +54,7 @@ func BurnPageData(w http.ResponseWriter, r *http.Request) {
 	err := json.NewEncoder(w).Encode(latestBurn)
 	if err != nil {
 		logger.Errorf("error sending latest burn page data: %v", err)
-		http.Error(w, "Internal server error", http.StatusServiceUnavailable)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 }

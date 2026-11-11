@@ -2,12 +2,13 @@ package handlers
 
 import (
 	"encoding/json"
-	"eth2-exporter/db"
-	"eth2-exporter/types"
-	"eth2-exporter/utils"
 	"net/http"
 	"strconv"
 	"strings"
+
+	"github.com/gobitfly/eth2-beaconchain-explorer/db"
+	"github.com/gobitfly/eth2-beaconchain-explorer/types"
+	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
 )
 
 // Eth2Deposits will return information about deposits using a go template
@@ -46,34 +47,12 @@ func Eth2DepositsData(w http.ResponseWriter, r *http.Request) {
 	if length > 100 {
 		length = 100
 	}
-
-	orderColumn := q.Get("order[0][column]")
-	orderByMap := map[string]string{
-		"0": "block_slot",
-		// "1": "validatorindex",
-		"1": "publickey",
-		"2": "amount",
-		"3": "withdrawalcredentials",
-		"4": "signature",
-	}
-	orderBy, exists := orderByMap[orderColumn]
-	if !exists {
-		orderBy = "block_ts"
-	}
-
 	orderDir := q.Get("order[0][dir]")
 
-	depositCount, err := db.GetEth2DepositsCount(search)
+	deposits, depositCount, err := db.GetEth2Deposits(search, length, start, orderDir)
 	if err != nil {
-		logger.Errorf("error retrieving eth2_deposit count: %v", err)
-		http.Error(w, "Internal server error", http.StatusServiceUnavailable)
-		return
-	}
-
-	deposits, err := db.GetEth2Deposits(search, length, start, orderBy, orderDir)
-	if err != nil {
-		logger.Errorf("error retrieving eth2_deposit data: %v", err)
-		http.Error(w, "Internal server error", http.StatusServiceUnavailable)
+		logger.Errorf("error retrieving eth2_deposit data or count: %v", err)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 
@@ -100,7 +79,7 @@ func Eth2DepositsData(w http.ResponseWriter, r *http.Request) {
 	err = json.NewEncoder(w).Encode(data)
 	if err != nil {
 		logger.Errorf("error enconding json response for %v route: %v", r.URL.String(), err)
-		http.Error(w, "Internal server error", http.StatusServiceUnavailable)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 }

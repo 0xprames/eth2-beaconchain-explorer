@@ -2,13 +2,14 @@ package templates
 
 import (
 	"embed"
-	"eth2-exporter/utils"
 	"fmt"
 	"html/template"
 	"io/fs"
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
 
 	"github.com/sirupsen/logrus"
 )
@@ -24,23 +25,29 @@ var templateCache = make(map[string]*template.Template)
 var templateCacheMux = &sync.RWMutex{}
 var templateFuncs = utils.GetTemplateFuncs()
 
-// compile time check for templates
-var _ error = CompileTimeCheck(fs.FS(Files))
-
 func GetTemplate(files ...string) *template.Template {
 	name := strings.Join(files, "-")
 
 	if utils.Config.Frontend.Debug {
-		templateFiles := make([]string, len(files))
-		copy(templateFiles, files)
-		for i := range files {
-			if strings.HasPrefix(files[i], "templates") {
-				templateFiles[i] = files[i]
+		templateFiles := make([]string, 0, len(files))
+		for _, file := range files {
+			if strings.Contains(file, "*") {
+				if !strings.HasPrefix(file, "templates") {
+					file = "templates/" + file
+				}
+				matches, err := filepath.Glob(file)
+				if err != nil {
+					logger.Errorf("error globbing template files: %s", err)
+					continue
+				}
+				templateFiles = append(templateFiles, matches...)
+			} else if strings.HasPrefix(file, "templates") {
+				templateFiles = append(templateFiles, file)
 			} else {
-				templateFiles[i] = "templates/" + files[i]
+				templateFiles = append(templateFiles, "templates/"+file)
 			}
 		}
-		return template.Must(template.New(name).Funcs(template.FuncMap(templateFuncs)).ParseFiles(templateFiles...))
+		return template.Must(template.New(name).Funcs(templateFuncs).ParseFiles(templateFiles...))
 	}
 
 	templateCacheMux.RLock()
@@ -50,7 +57,7 @@ func GetTemplate(files ...string) *template.Template {
 	}
 	templateCacheMux.RUnlock()
 
-	tmpl := template.Must(template.New(name).Funcs(template.FuncMap(templateFuncs)).ParseFS(Files, files...))
+	tmpl := template.Must(template.New(name).Funcs(templateFuncs).ParseFS(Files, files...))
 	templateCacheMux.Lock()
 	defer templateCacheMux.Unlock()
 	templateCache[name] = tmpl
@@ -97,24 +104,4 @@ func getFileSysNames(fsys fs.FS, dirname string) ([]string, error) {
 	}
 
 	return files, nil
-}
-
-func AddTemplateFile(tmpl *template.Template, path string) *template.Template {
-	name := filepath.Base(path)
-	if utils.Config.Frontend.Debug {
-		return template.Must(tmpl.ParseFiles(path))
-	}
-
-	templateCacheMux.RLock()
-	if templateCache[name] != nil {
-		defer templateCacheMux.RUnlock()
-		return templateCache[name]
-	}
-	templateCacheMux.RUnlock()
-
-	tmpl = template.Must(tmpl.ParseFiles(path))
-	templateCacheMux.Lock()
-	defer templateCacheMux.Unlock()
-	templateCache[name] = tmpl
-	return templateCache[name]
 }

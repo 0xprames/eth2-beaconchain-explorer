@@ -2,14 +2,15 @@ package handlers
 
 import (
 	"encoding/json"
-	"eth2-exporter/db"
-	"eth2-exporter/services"
-	"eth2-exporter/templates"
-	"eth2-exporter/types"
-	"eth2-exporter/utils"
 	"fmt"
 	"net/http"
 	"strconv"
+
+	"github.com/gobitfly/eth2-beaconchain-explorer/db"
+	"github.com/gobitfly/eth2-beaconchain-explorer/services"
+	"github.com/gobitfly/eth2-beaconchain-explorer/templates"
+	"github.com/gobitfly/eth2-beaconchain-explorer/types"
+	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
 )
 
 // Epochs will return the epochs using a go template
@@ -85,7 +86,7 @@ func EpochsData(w http.ResponseWriter, r *http.Request) {
 				attesterslashingscount, 
 				attestationscount, 
 				depositscount, 
-				withdrawalcount,
+				COALESCE(withdrawalcount,0) as withdrawalcount,
 				voluntaryexitscount, 
 				validatorscount, 
 				averagevalidatorbalance, 
@@ -117,7 +118,7 @@ func EpochsData(w http.ResponseWriter, r *http.Request) {
 	}
 	if err != nil {
 		logger.Errorf("error retrieving epoch data: %v", err)
-		http.Error(w, "Internal server error", http.StatusServiceUnavailable)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 
@@ -127,9 +128,9 @@ func EpochsData(w http.ResponseWriter, r *http.Request) {
 		tableData[i] = []interface{}{
 			utils.FormatEpoch(b.Epoch),
 			utils.FormatTimestamp(utils.EpochToTime(b.Epoch).Unix()),
-			b.AttestationsCount,
-			fmt.Sprintf("%v / %v", b.DepositsCount, b.WithdrawalCount),
-			fmt.Sprintf("%v / %v", b.ProposerSlashingsCount, b.AttesterSlashingsCount),
+			utils.FormatCount(b.AttestationsCount, b.Finalized, false),
+			fmt.Sprintf("%v / %v", utils.FormatCount(b.DepositsCount, b.Finalized, true), utils.FormatCount(b.WithdrawalCount, b.Finalized, true)),
+			fmt.Sprintf("%v / %v", utils.FormatCount(b.ProposerSlashingsCount, b.Finalized, true), utils.FormatCount(b.AttesterSlashingsCount, b.Finalized, true)),
 			utils.FormatYesNo(b.Finalized),
 			utils.FormatBalance(b.EligibleEther, currency),
 			utils.FormatGlobalParticipationRate(b.VotedEther, b.GlobalParticipationRate, currency),
@@ -151,7 +152,7 @@ func EpochsData(w http.ResponseWriter, r *http.Request) {
 	err = json.NewEncoder(w).Encode(data)
 	if err != nil {
 		logger.Errorf("error enconding json response for %v route: %v", r.URL.String(), err)
-		http.Error(w, "Internal server error", http.StatusServiceUnavailable)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 

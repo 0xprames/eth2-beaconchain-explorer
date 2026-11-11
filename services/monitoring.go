@@ -3,13 +3,14 @@ package services
 import (
 	"context"
 	"database/sql"
-	"eth2-exporter/db"
-	"eth2-exporter/utils"
 	"fmt"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/gobitfly/eth2-beaconchain-explorer/db"
+	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
 
 	"github.com/go-redis/redis/v8"
 )
@@ -110,7 +111,7 @@ func startElDataMonitoringService() {
 		}
 		blockBlocksTable, err := db.BigtableClient.GetBlockFromBlocksTable(uint64(numberBlocksTable))
 		if err != nil {
-			errorMsg := fmt.Errorf("error: could not retrieve latest block from the blocks table: %v", err)
+			errorMsg := fmt.Errorf("error: could not retrieve latest block (%d) from the blocks table: %v", numberBlocksTable, err)
 			ReportStatus(name, errorMsg.Error(), nil)
 			continue
 		}

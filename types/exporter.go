@@ -94,8 +94,9 @@ type Validator struct {
 
 // ValidatorQueue is a struct to hold validator queue data
 type ValidatorQueue struct {
-	Activating uint64
-	Exiting    uint64
+	Activating     uint64
+	Exiting        uint64
+	ExitingBalance uint64
 }
 
 type SyncAggregate struct {
@@ -192,7 +193,7 @@ type ExecutionPayload struct {
 type Withdrawals struct {
 	Slot           uint64 `json:"slot,omitempty"`
 	BlockRoot      []byte `json:"blockroot,omitempty"`
-	Index          uint64 `json:"index"`
+	Index          int64  `json:"index"`
 	ValidatorIndex uint64 `json:"validatorindex"`
 	Address        []byte `json:"address"`
 	Amount         uint64 `json:"amount"`
@@ -206,7 +207,7 @@ type WithdrawalsByEpoch struct {
 
 type WithdrawalsNotification struct {
 	Slot           uint64 `json:"slot,omitempty"`
-	Index          uint64 `json:"index"`
+	Index          int64  `json:"index"`
 	ValidatorIndex uint64 `json:"validatorindex"`
 	Address        []byte `json:"address"`
 	Amount         uint64 `json:"amount"`
@@ -318,6 +319,7 @@ type Eth1Deposit struct {
 	MerkletreeIndex       []byte `db:"merkletree_index"`
 	Removed               bool   `db:"removed"`
 	ValidSignature        bool   `db:"valid_signature"`
+	Valid                 bool   // either by ValidSignature or by having a previous valid deposit
 }
 
 // Eth2Deposit is a struct to hold eth2-deposit data
@@ -330,6 +332,7 @@ type Eth2Deposit struct {
 	Withdrawalcredentials []byte `db:"withdrawalcredentials"`
 	Amount                uint64 `db:"amount"`
 	Signature             []byte `db:"signature"`
+	Valid                 bool   `db:"valid"`
 }
 
 // EthStoreDay is a struct to hold performance data for a specific beaconchain-day.
@@ -642,11 +645,15 @@ type ValidatorStatsTableDbRow struct {
 	AttesterSlashings int64 `db:"attester_slashings"`
 	ProposerSlashing  int64 `db:"proposer_slashings"`
 
-	Deposits       int64 `db:"deposits"`
-	DepositsAmount int64 `db:"deposits_amount"`
+	Deposits            int64 `db:"deposits"`
+	DepositsTotal       int64 `db:"deposits_total"`
+	DepositsAmount      int64 `db:"deposits_amount"`
+	DepositsAmountTotal int64 `db:"deposits_amount_total"`
 
-	Withdrawals       int64 `db:"withdrawals"`
-	WithdrawalsAmount int64 `db:"withdrawals_amount"`
+	Withdrawals            int64 `db:"withdrawals"`
+	WithdrawalsTotal       int64 `db:"withdrawals_total"`
+	WithdrawalsAmount      int64 `db:"withdrawals_amount"`
+	WithdrawalsAmountTotal int64 `db:"withdrawals_amount_total"`
 
 	ClRewardsGWei      int64 `db:"cl_rewards_gwei"`
 	ClRewardsGWeiTotal int64 `db:"cl_rewards_gwei_total"`

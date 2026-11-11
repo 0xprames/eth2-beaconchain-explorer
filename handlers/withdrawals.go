@@ -3,11 +3,6 @@ package handlers
 import (
 	"context"
 	"encoding/json"
-	"eth2-exporter/db"
-	"eth2-exporter/services"
-	"eth2-exporter/templates"
-	"eth2-exporter/types"
-	"eth2-exporter/utils"
 	"fmt"
 	"html/template"
 	"math/big"
@@ -15,6 +10,12 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/gobitfly/eth2-beaconchain-explorer/db"
+	"github.com/gobitfly/eth2-beaconchain-explorer/services"
+	"github.com/gobitfly/eth2-beaconchain-explorer/templates"
+	"github.com/gobitfly/eth2-beaconchain-explorer/types"
+	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
 
 	"golang.org/x/sync/errgroup"
 )
@@ -89,14 +90,14 @@ func WithdrawalsData(w http.ResponseWriter, r *http.Request) {
 	data, err := WithdrawalsTableData(draw, search, length, start, orderBy, orderDir, currency)
 	if err != nil {
 		logger.Errorf("error getting withdrawal table data: %v", err)
-		http.Error(w, "Internal server error", http.StatusServiceUnavailable)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 
 	err = json.NewEncoder(w).Encode(data)
 	if err != nil {
 		logger.Errorf("error enconding json response for %v route: %v", r.URL.String(), err)
-		http.Error(w, "Internal server error", http.StatusServiceUnavailable)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 }
@@ -197,13 +198,13 @@ func WithdrawalsTableData(draw uint64, search string, length, start uint64, orde
 	tableData := make([][]interface{}, len(withdrawals))
 	for i, w := range withdrawals {
 		tableData[i] = []interface{}{
-			template.HTML(fmt.Sprintf("%v", utils.FormatEpoch(utils.EpochOfSlot(w.Slot)))),
-			template.HTML(fmt.Sprintf("%v", utils.FormatBlockSlot(w.Slot))),
-			template.HTML(fmt.Sprintf("%v", w.Index)),
-			template.HTML(fmt.Sprintf("%v", utils.FormatValidator(w.ValidatorIndex))),
-			template.HTML(fmt.Sprintf("%v", utils.FormatTimestamp(utils.SlotToTime(w.Slot).Unix()))),
-			template.HTML(fmt.Sprintf("%v", utils.FormatAddressWithLimits(w.Address, names[string(w.Address)], false, "address", visibleDigitsForHash+5, 18, true))),
-			template.HTML(fmt.Sprintf("%v", utils.FormatAmount(new(big.Int).Mul(new(big.Int).SetUint64(w.Amount), big.NewInt(1e9)), formatCurrency, 6))),
+			utils.FormatEpoch(utils.EpochOfSlot(w.Slot)),
+			utils.FormatBlockSlot(w.Slot),
+			template.HTML(fmt.Sprintf("%v", w.Index)), // show negative index as is
+			utils.FormatValidator(w.ValidatorIndex),
+			utils.FormatTimestamp(utils.SlotToTime(w.Slot).Unix()),
+			utils.FormatAddressWithLimits(w.Address, names[string(w.Address)], false, "address", visibleDigitsForHash+5, 18, true),
+			utils.FormatAmount(new(big.Int).Mul(new(big.Int).SetUint64(w.Amount), big.NewInt(1e9)), formatCurrency, 6),
 		}
 	}
 
@@ -264,14 +265,14 @@ func BLSChangeData(w http.ResponseWriter, r *http.Request) {
 	data, err := BLSTableData(draw, search, length, start, orderBy, orderDir)
 	if err != nil {
 		logger.Errorf("Error getting bls changes: %v", err)
-		http.Error(w, "Internal server error", http.StatusServiceUnavailable)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 
 	err = json.NewEncoder(w).Encode(data)
 	if err != nil {
 		logger.Errorf("error enconding json response for %v route: %v", r.URL.String(), err)
-		http.Error(w, "Internal server error", http.StatusServiceUnavailable)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 }
@@ -363,12 +364,12 @@ func BLSTableData(draw uint64, search string, length, start uint64, orderBy, ord
 	tableData := make([][]interface{}, len(blsChange))
 	for i, bls := range blsChange {
 		tableData[i] = []interface{}{
-			template.HTML(fmt.Sprintf("%v", utils.FormatEpoch(utils.EpochOfSlot(bls.Slot)))),
-			template.HTML(fmt.Sprintf("%v", utils.FormatBlockSlot(bls.Slot))),
-			template.HTML(fmt.Sprintf("%v", utils.FormatValidator(bls.Validatorindex))),
-			template.HTML(fmt.Sprintf("%v", utils.FormatHashWithCopy(bls.Signature))),
-			template.HTML(fmt.Sprintf("%v", utils.FormatHashWithCopy(bls.BlsPubkey))),
-			template.HTML(fmt.Sprintf("%v", utils.FormatAddressWithLimits(bls.Address, names[string(bls.Address)], false, "address", visibleDigitsForHash+5, 18, true))),
+			utils.FormatEpoch(utils.EpochOfSlot(bls.Slot)),
+			utils.FormatBlockSlot(bls.Slot),
+			utils.FormatValidator(bls.Validatorindex),
+			utils.FormatHashWithCopy(bls.Signature),
+			utils.FormatHashWithCopy(bls.BlsPubkey),
+			utils.FormatAddressWithLimits(bls.Address, names[string(bls.Address)], false, "address", visibleDigitsForHash+5, 18, true),
 		}
 	}
 

@@ -4,32 +4,33 @@ import (
 	"context"
 	"encoding/gob"
 	"encoding/hex"
-	"eth2-exporter/cache"
-	"eth2-exporter/db"
-	ethclients "eth2-exporter/ethClients"
-	"eth2-exporter/exporter"
-	"eth2-exporter/handlers"
-	"eth2-exporter/metrics"
-	"eth2-exporter/price"
-	"eth2-exporter/rpc"
-	"eth2-exporter/services"
-	"eth2-exporter/static"
-	"eth2-exporter/types"
-	"eth2-exporter/utils"
-	"eth2-exporter/version"
+	"errors"
 	"flag"
 	"fmt"
+	"log"
 	"math/big"
 	"net/http"
 	"strings"
 	"sync"
 	"time"
 
-	httpSwagger "github.com/swaggo/http-swagger"
+	"github.com/gobitfly/eth2-beaconchain-explorer/cache"
+	"github.com/gobitfly/eth2-beaconchain-explorer/db"
+	ethclients "github.com/gobitfly/eth2-beaconchain-explorer/ethClients"
+	"github.com/gobitfly/eth2-beaconchain-explorer/exporter"
+	"github.com/gobitfly/eth2-beaconchain-explorer/handlers"
+	"github.com/gobitfly/eth2-beaconchain-explorer/metrics"
+	"github.com/gobitfly/eth2-beaconchain-explorer/price"
+	"github.com/gobitfly/eth2-beaconchain-explorer/ratelimit"
+	"github.com/gobitfly/eth2-beaconchain-explorer/rpc"
+	"github.com/gobitfly/eth2-beaconchain-explorer/services"
+	"github.com/gobitfly/eth2-beaconchain-explorer/static"
+	"github.com/gobitfly/eth2-beaconchain-explorer/types"
+	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
+	"github.com/gobitfly/eth2-beaconchain-explorer/version"
 
 	"github.com/sirupsen/logrus"
 
-	_ "eth2-exporter/docs"
 	_ "net/http/pprof"
 
 	"github.com/gorilla/csrf"
@@ -46,14 +47,17 @@ func initStripe(http *mux.Router) error {
 		return fmt.Errorf("error no config found")
 	}
 	stripe.Key = utils.Config.Frontend.Stripe.SecretKey
-	http.HandleFunc("/stripe/create-checkout-session", handlers.StripeCreateCheckoutSession).Methods("POST")
-	http.HandleFunc("/stripe/customer-portal", handlers.StripeCustomerPortal).Methods("POST")
+	http.HandleFunc("/stripe/create-checkout-session", handlers.StripeCreateCheckoutSession).Methods("POST", "OPTIONS")
+	http.HandleFunc("/stripe/customer-portal", handlers.StripeCustomerPortal).Methods("POST", "OPTIONS")
 	return nil
 }
 
 func init() {
 	gob.Register(types.DataTableSaveState{})
+	gob.Register(types.UserV1Notification(0))
 }
+
+var frontendHttpServer *http.Server
 
 func main() {
 	configPath := flag.String("config", "", "Path to the config file, if empty string defaults will be used")
@@ -65,6 +69,7 @@ func main() {
 		fmt.Println(version.GoVersion)
 		return
 	}
+	log.SetFlags(log.LstdFlags | log.Lshortfile)
 
 	cfg := &types.Config{}
 	err := utils.ReadConfig(cfg, *configPath)
@@ -101,6 +106,7 @@ func main() {
 			Port:         cfg.WriterDatabase.Port,
 			MaxOpenConns: cfg.WriterDatabase.MaxOpenConns,
 			MaxIdleConns: cfg.WriterDatabase.MaxIdleConns,
+			SSL:          cfg.WriterDatabase.SSL,
 		}, &types.DatabaseConfig{
 			Username:     cfg.ReaderDatabase.Username,
 			Password:     cfg.ReaderDatabase.Password,
@@ -109,7 +115,8 @@ func main() {
 			Port:         cfg.ReaderDatabase.Port,
 			MaxOpenConns: cfg.ReaderDatabase.MaxOpenConns,
 			MaxIdleConns: cfg.ReaderDatabase.MaxIdleConns,
-		})
+			SSL:          cfg.ReaderDatabase.SSL,
+		}, "pgx", "postgres")
 	}()
 
 	wg.Add(1)
@@ -123,6 +130,7 @@ func main() {
 			Port:         cfg.Frontend.WriterDatabase.Port,
 			MaxOpenConns: cfg.Frontend.WriterDatabase.MaxOpenConns,
 			MaxIdleConns: cfg.Frontend.WriterDatabase.MaxIdleConns,
+			SSL:          cfg.Frontend.WriterDatabase.SSL,
 		}, &types.DatabaseConfig{
 			Username:     cfg.Frontend.ReaderDatabase.Username,
 			Password:     cfg.Frontend.ReaderDatabase.Password,
@@ -131,8 +139,26 @@ func main() {
 			Port:         cfg.Frontend.ReaderDatabase.Port,
 			MaxOpenConns: cfg.Frontend.ReaderDatabase.MaxOpenConns,
 			MaxIdleConns: cfg.Frontend.ReaderDatabase.MaxIdleConns,
-		})
+			SSL:          cfg.Frontend.ReaderDatabase.SSL,
+		}, "pgx", "postgres")
 	}()
+
+	if utils.Config.ClickHouseEnabled {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			db.MustInitClickhouseDB(nil, &types.DatabaseConfig{
+				Username:     cfg.ClickHouse.ReaderDatabase.Username,
+				Password:     cfg.ClickHouse.ReaderDatabase.Password,
+				Name:         cfg.ClickHouse.ReaderDatabase.Name,
+				Host:         cfg.ClickHouse.ReaderDatabase.Host,
+				Port:         cfg.ClickHouse.ReaderDatabase.Port,
+				MaxOpenConns: cfg.ClickHouse.ReaderDatabase.MaxOpenConns,
+				MaxIdleConns: cfg.ClickHouse.ReaderDatabase.MaxIdleConns,
+				SSL:          true,
+			}, "clickhouse", "clickhouse")
+		}()
+	}
 
 	wg.Add(1)
 	go func() {
@@ -248,7 +274,8 @@ func main() {
 		router := mux.NewRouter()
 
 		apiV1Router := router.PathPrefix("/api/v1").Subrouter()
-		router.PathPrefix("/api/v1/docs/").Handler(httpSwagger.WrapHandler)
+		apiV1Router.HandleFunc("/docs", handlers.ApiDocs).Methods("GET")
+		apiV1Router.HandleFunc("/latestState", handlers.ApiLatestState).Methods("GET", "OPTIONS")
 		apiV1Router.HandleFunc("/epoch/{epoch}", handlers.ApiEpoch).Methods("GET", "OPTIONS")
 
 		apiV1Router.HandleFunc("/epoch/{epoch}/blocks", handlers.ApiEpochSlots).Methods("GET", "OPTIONS")
@@ -260,6 +287,9 @@ func main() {
 		apiV1Router.HandleFunc("/slot/{slot}/proposerslashings", handlers.ApiSlotProposerSlashings).Methods("GET", "OPTIONS")
 		apiV1Router.HandleFunc("/slot/{slot}/voluntaryexits", handlers.ApiSlotVoluntaryExits).Methods("GET", "OPTIONS")
 		apiV1Router.HandleFunc("/slot/{slot}/withdrawals", handlers.ApiSlotWithdrawals).Methods("GET", "OPTIONS")
+		apiV1Router.HandleFunc("/slot/{slot}/consolidation_requests", handlers.ApiSlotConsolidationRequests).Methods("GET", "OPTIONS")
+		apiV1Router.HandleFunc("/slot/{slot}/switch_to_compounding_requests", handlers.ApiSlotSwitchToCompoundingRequests).Methods("GET", "OPTIONS")
+		apiV1Router.HandleFunc("/slot/{slot}/deposit_requests", handlers.ApiSlotDepositRequests).Methods("GET", "OPTIONS")
 
 		// deprecated, use slot equivalents
 		apiV1Router.HandleFunc("/block/{slotOrHash}", handlers.ApiSlots).Methods("GET", "OPTIONS")
@@ -268,6 +298,9 @@ func main() {
 		apiV1Router.HandleFunc("/block/{slot}/attesterslashings", handlers.ApiSlotAttesterSlashings).Methods("GET", "OPTIONS")
 		apiV1Router.HandleFunc("/block/{slot}/proposerslashings", handlers.ApiSlotProposerSlashings).Methods("GET", "OPTIONS")
 		apiV1Router.HandleFunc("/block/{slot}/voluntaryexits", handlers.ApiSlotVoluntaryExits).Methods("GET", "OPTIONS")
+		apiV1Router.HandleFunc("/block/{slot}/consolidation_requests", handlers.ApiSlotConsolidationRequests).Methods("GET", "OPTIONS")
+		apiV1Router.HandleFunc("/block/{slot}/switch_to_compounding_requests", handlers.ApiSlotSwitchToCompoundingRequests).Methods("GET", "OPTIONS")
+		apiV1Router.HandleFunc("/block/{slot}/deposit_requests", handlers.ApiSlotDepositRequests).Methods("GET", "OPTIONS")
 
 		apiV1Router.HandleFunc("/sync_committee/{period}", handlers.ApiSyncCommittee).Methods("GET", "OPTIONS")
 		apiV1Router.HandleFunc("/eth1deposit/{txhash}", handlers.ApiEth1Deposit).Methods("GET", "OPTIONS")
@@ -282,6 +315,8 @@ func main() {
 		apiV1Router.HandleFunc("/validator/{indexOrPubkey}/execution/performance", handlers.ApiValidatorExecutionPerformance).Methods("GET", "OPTIONS")
 		apiV1Router.HandleFunc("/validator/{indexOrPubkey}/attestations", handlers.ApiValidatorAttestations).Methods("GET", "OPTIONS")
 		apiV1Router.HandleFunc("/validator/{indexOrPubkey}/proposals", handlers.ApiValidatorProposals).Methods("GET", "OPTIONS")
+		apiV1Router.HandleFunc("/validator/{indexOrPubkey}/consolidation_requests", handlers.ApiValidatorConsolidationRequests).Methods("GET", "OPTIONS")
+		apiV1Router.HandleFunc("/validator/{indexOrPubkey}/switch_to_compounding_requests", handlers.ApiValidatorSwitchToCompoundingRequests).Methods("GET", "OPTIONS")
 		apiV1Router.HandleFunc("/validator/{indexOrPubkey}/deposits", handlers.ApiValidatorDeposits).Methods("GET", "OPTIONS")
 		apiV1Router.HandleFunc("/validator/{indexOrPubkey}/attestationefficiency", handlers.ApiValidatorAttestationEfficiency).Methods("GET", "OPTIONS")
 		apiV1Router.HandleFunc("/validator/{indexOrPubkey}/attestationeffectiveness", handlers.ApiValidatorAttestationEffectiveness).Methods("GET", "OPTIONS")
@@ -294,8 +329,6 @@ func main() {
 		apiV1Router.HandleFunc("/chart/{chart}", handlers.ApiChart).Methods("GET", "OPTIONS")
 		apiV1Router.HandleFunc("/user/token", handlers.APIGetToken).Methods("POST", "OPTIONS")
 		apiV1Router.HandleFunc("/dashboard/data/allbalances", handlers.DashboardDataBalanceCombined).Methods("GET", "OPTIONS") // consensus & execution
-		apiV1Router.HandleFunc("/dashboard/data/balances", handlers.DashboardDataBalance).Methods("GET", "OPTIONS")            // new app versions
-		apiV1Router.HandleFunc("/dashboard/data/balance", handlers.APIDashboardDataBalance).Methods("GET", "OPTIONS")          // old app versions
 		apiV1Router.HandleFunc("/dashboard/data/proposals", handlers.DashboardDataProposals).Methods("GET", "OPTIONS")
 		apiV1Router.HandleFunc("/stripe/webhook", handlers.StripeWebhook).Methods("POST")
 		apiV1Router.HandleFunc("/stats/{apiKey}/{machine}", handlers.ClientStatsPostOld).Methods("POST", "OPTIONS")
@@ -311,11 +344,7 @@ func main() {
 		apiV1Router.HandleFunc("/execution/{addressIndexOrPubkey}/produced", handlers.ApiETH1AccountProducedBlocks).Methods("GET", "OPTIONS")
 
 		apiV1Router.HandleFunc("/execution/address/{address}", handlers.ApiEth1Address).Methods("GET", "OPTIONS")
-		apiV1Router.HandleFunc("/execution/address/{address}/transactions", handlers.ApiEth1AddressTx).Methods("GET", "OPTIONS")
-		apiV1Router.HandleFunc("/execution/address/{address}/internalTx", handlers.ApiEth1AddressItx).Methods("GET", "OPTIONS")
-		apiV1Router.HandleFunc("/execution/address/{address}/blocks", handlers.ApiEth1AddressBlocks).Methods("GET", "OPTIONS")
-		apiV1Router.HandleFunc("/execution/address/{address}/uncles", handlers.ApiEth1AddressUncles).Methods("GET", "OPTIONS")
-		apiV1Router.HandleFunc("/execution/address/{address}/tokens", handlers.ApiEth1AddressTokens).Methods("GET", "OPTIONS")
+		apiV1Router.HandleFunc("/execution/address/{address}/erc20tokens", handlers.ApiEth1AddressERC20Tokens).Methods("GET", "OPTIONS")
 
 		apiV1Router.HandleFunc("/validator/{indexOrPubkey}/widget", handlers.GetMobileWidgetStatsGet).Methods("GET")
 		apiV1Router.HandleFunc("/dashboard/widget", handlers.GetMobileWidgetStatsPost).Methods("POST")
@@ -332,6 +361,7 @@ func main() {
 		apiV1AuthRouter.HandleFunc("/validator/{pubkey}/add", handlers.UserValidatorWatchlistAdd).Methods("POST", "OPTIONS")
 		apiV1AuthRouter.HandleFunc("/validator/{pubkey}/remove", handlers.UserValidatorWatchlistRemove).Methods("POST", "OPTIONS")
 		apiV1AuthRouter.HandleFunc("/dashboard/save", handlers.UserDashboardWatchlistAdd).Methods("POST", "OPTIONS")
+		apiV1AuthRouter.HandleFunc("/dashboard/remove", handlers.UserDashboardWatchlistRemove).Methods("POST", "OPTIONS")
 		apiV1AuthRouter.HandleFunc("/notifications/bundled/subscribe", handlers.MultipleUsersNotificationsSubscribe).Methods("POST", "OPTIONS")
 		apiV1AuthRouter.HandleFunc("/notifications/bundled/unsubscribe", handlers.MultipleUsersNotificationsUnsubscribe).Methods("POST", "OPTIONS")
 		apiV1AuthRouter.HandleFunc("/notifications/subscribe", handlers.UserNotificationsSubscribe).Methods("POST", "OPTIONS")
@@ -373,11 +403,14 @@ func main() {
 			if err != nil {
 				logrus.WithError(err).Error("error decoding csrf auth key falling back to empty csrf key")
 			}
+
 			csrfHandler := csrf.Protect(
 				csrfBytes,
 				csrf.FieldName("CsrfField"),
 				csrf.Secure(!cfg.Frontend.CsrfInsecure),
 				csrf.Path("/"),
+				// csrf.Domain(cfg.Frontend.SessionCookieDomain),
+				csrf.SameSite(csrf.SameSiteNoneMode),
 			)
 
 			router.HandleFunc("/", handlers.Index).Methods("GET")
@@ -413,6 +446,7 @@ func main() {
 			router.HandleFunc("/block/{block}", handlers.Eth1Block).Methods("GET")
 			router.HandleFunc("/block/{block}/transactions", handlers.BlockTransactionsData).Methods("GET")
 			router.HandleFunc("/tx/{hash}", handlers.Eth1TransactionTx).Methods("GET")
+			router.HandleFunc("/tx/{hash}/data", handlers.Eth1TransactionTxData).Methods("GET")
 			router.HandleFunc("/mempool", handlers.MempoolView).Methods("GET")
 			router.HandleFunc("/burn", handlers.Burn).Methods("GET")
 			router.HandleFunc("/burn/data", handlers.BurnPageData).Methods("GET")
@@ -443,7 +477,6 @@ func main() {
 			router.HandleFunc("/validator/{pubkey}/name", handlers.SaveValidatorName).Methods("POST")
 			router.HandleFunc("/watchlist/add", handlers.UsersModalAddValidator).Methods("POST")
 			router.HandleFunc("/validator/{pubkey}/remove", handlers.UserValidatorWatchlistRemove).Methods("POST")
-			router.HandleFunc("/validator/{index}/stats", handlers.ValidatorStatsTable).Methods("GET")
 			router.HandleFunc("/validators", handlers.Validators).Methods("GET")
 			router.HandleFunc("/validators/data", handlers.ValidatorsData).Methods("GET")
 			router.HandleFunc("/validators/slashings", handlers.ValidatorsSlashings).Methods("GET")
@@ -461,18 +494,10 @@ func main() {
 			router.HandleFunc("/validators/included-deposits", handlers.Eth2Deposits).Methods("GET") // deprecated, will redirect to /validators/deposits
 			router.HandleFunc("/validators/included-deposits/data", handlers.Eth2DepositsData).Methods("GET")
 
-			router.HandleFunc("/heatmap", handlers.Heatmap).Methods("GET")
-
-			router.HandleFunc("/dashboard", handlers.Dashboard).Methods("GET")
 			router.HandleFunc("/dashboard/save", handlers.UserDashboardWatchlistAdd).Methods("POST")
 
 			router.HandleFunc("/dashboard/data/allbalances", handlers.DashboardDataBalanceCombined).Methods("GET")
-			router.HandleFunc("/dashboard/data/proposals", handlers.DashboardDataProposals).Methods("GET")
-			router.HandleFunc("/dashboard/data/proposalshistory", handlers.DashboardDataProposalsHistory).Methods("GET")
-			router.HandleFunc("/dashboard/data/validators", handlers.DashboardDataValidators).Methods("GET")
-			router.HandleFunc("/dashboard/data/withdrawal", handlers.DashboardDataWithdrawals).Methods("GET")
-			router.HandleFunc("/dashboard/data/effectiveness", handlers.DashboardDataEffectiveness).Methods("GET")
-			router.HandleFunc("/dashboard/data/earnings", handlers.DashboardDataEarnings).Methods("GET")
+
 			router.HandleFunc("/graffitiwall", handlers.Graffitiwall).Methods("GET")
 			router.HandleFunc("/calculator", handlers.StakingCalculator).Methods("GET")
 			router.HandleFunc("/search", handlers.Search).Methods("POST")
@@ -493,7 +518,11 @@ func main() {
 			router.HandleFunc("/stakingServices", handlers.StakingServices).Methods("GET")
 
 			router.HandleFunc("/ethClients", handlers.EthClientsServices).Methods("GET")
-			router.HandleFunc("/pools", handlers.Pools).Methods("GET")
+			router.HandleFunc("/entities", handlers.Entities).Methods("GET")
+			router.HandleFunc("/entities/data", handlers.EntitiesData).Methods("GET")
+			router.HandleFunc("/entity/{entity}/{subEntity}", handlers.EntityDetail).Methods("GET")
+			router.HandleFunc("/entity/{entity}/{subEntity}/subentities/data", handlers.EntitySubEntitiesData).Methods("GET")
+			router.HandleFunc("/entity/{entity}/{subEntity}/validators/data", handlers.EntityValidatorsData).Methods("GET")
 			router.HandleFunc("/relays", handlers.Relays).Methods("GET")
 			router.HandleFunc("/pools/rocketpool", handlers.PoolsRocketpool).Methods("GET")
 			router.HandleFunc("/pools/rocketpool/data/minipools", handlers.PoolsRocketpoolDataMinipools).Methods("GET")
@@ -507,9 +536,6 @@ func main() {
 			// confirming the email update should not require auth
 			router.HandleFunc("/settings/email/{hash}", handlers.UserConfirmUpdateEmail).Methods("GET")
 			router.HandleFunc("/gitcoinfeed", handlers.GitcoinFeed).Methods("GET")
-			router.HandleFunc("/rewards", handlers.ValidatorRewards).Methods("GET")
-			router.HandleFunc("/rewards/hist", handlers.RewardsHistoricalData).Methods("GET")
-			router.HandleFunc("/rewards/hist/download", handlers.DownloadRewardsHistoricalData).Methods("GET")
 
 			router.HandleFunc("/notifications/unsubscribe", handlers.UserNotificationsUnsubscribeByHash).Methods("GET")
 
@@ -567,16 +593,10 @@ func main() {
 
 			authRouter.HandleFunc("/notifications-center", handlers.UserNotificationsCenter).Methods("GET")
 			authRouter.HandleFunc("/notifications-center/removeall", handlers.RemoveAllValidatorsAndUnsubscribe).Methods("POST")
-			authRouter.HandleFunc("/notifications-center/validatorsub", handlers.AddValidatorsAndSubscribe).Methods("POST")
-			authRouter.HandleFunc("/notifications-center/updatesubs", handlers.UserUpdateSubscriptions).Methods("POST")
 
 			authRouter.HandleFunc("/subscriptions/data", handlers.UserSubscriptionsData).Methods("GET")
 			authRouter.HandleFunc("/generateKey", handlers.GenerateAPIKey).Methods("POST")
 			authRouter.HandleFunc("/ethClients", handlers.EthClientsServices).Methods("GET")
-			authRouter.HandleFunc("/rewards", handlers.ValidatorRewards).Methods("GET")
-			authRouter.HandleFunc("/rewards/subscribe", handlers.RewardNotificationSubscribe).Methods("POST")
-			authRouter.HandleFunc("/rewards/unsubscribe", handlers.RewardNotificationUnsubscribe).Methods("POST")
-			authRouter.HandleFunc("/rewards/subscriptions/data", handlers.RewardGetUserSubscriptions).Methods("POST")
 			authRouter.HandleFunc("/webhooks", handlers.NotificationWebhookPage).Methods("GET")
 			authRouter.HandleFunc("/webhooks/add", handlers.UsersAddWebhook).Methods("POST")
 			authRouter.HandleFunc("/webhooks/{webhookID}/update", handlers.UsersEditWebhook).Methods("POST")
@@ -589,20 +609,20 @@ func main() {
 
 			authRouter.Use(handlers.UserAuthMiddleware)
 			authRouter.Use(csrfHandler)
+			authRouter.Use(utils.CORSMiddleware)
 
 			if utils.Config.Frontend.Debug {
-				// serve files from local directory when debugging, instead of from go embed file
+				logrus.Infof("serving frontend file from static/ directory")
+				// serve files from the local filesystem when debugging, instead of the go embedded file system
 				templatesHandler := http.FileServer(http.Dir("templates"))
 				router.PathPrefix("/templates").Handler(http.StripPrefix("/templates/", templatesHandler))
 
-				cssHandler := http.FileServer(http.Dir("static/css"))
-				router.PathPrefix("/css").Handler(http.StripPrefix("/css/", cssHandler))
-
-				jsHandler := http.FileServer(http.Dir("static/js"))
-				router.PathPrefix("/js").Handler(http.StripPrefix("/js/", jsHandler))
+				staticHandler := http.FileServer(http.Dir("static/"))
+				router.PathPrefix("/").Handler(http.StripPrefix("/", staticHandler))
+			} else {
+				fileSys := http.FS(static.Files)
+				router.PathPrefix("/").Handler(handlers.CustomFileServer(http.FileServer(fileSys), fileSys, handlers.NotFound))
 			}
-			fileSys := http.FS(static.Files)
-			router.PathPrefix("/").Handler(handlers.CustomFileServer(http.FileServer(fileSys), fileSys, handlers.NotFound))
 
 		}
 
@@ -610,11 +630,14 @@ func main() {
 			router.Use(metrics.HttpMiddleware)
 		}
 
+		ratelimit.Init()
+		router.Use(ratelimit.HttpMiddleware)
+
 		n := negroni.New(negroni.NewRecovery())
 		n.Use(gzip.Gzip(gzip.DefaultCompression))
 
 		pa := &proxyaddr.ProxyAddr{}
-		pa.Init(proxyaddr.CIDRLoopback)
+		_ = pa.Init(proxyaddr.CIDRLoopback)
 		n.Use(pa)
 
 		n.UseHandler(utils.SessionStore.SCS.LoadAndSave(router))
@@ -626,9 +649,9 @@ func main() {
 			utils.Config.Frontend.HttpReadTimeout = time.Second * 15
 		}
 		if utils.Config.Frontend.HttpIdleTimeout == 0 {
-			utils.Config.Frontend.HttpIdleTimeout = time.Second * 60
+			utils.Config.Frontend.HttpIdleTimeout = time.Minute
 		}
-		srv := &http.Server{
+		frontendHttpServer = &http.Server{
 			Addr:         cfg.Frontend.Server.Host + ":" + cfg.Frontend.Server.Port,
 			WriteTimeout: utils.Config.Frontend.HttpWriteTimeout,
 			ReadTimeout:  utils.Config.Frontend.HttpReadTimeout,
@@ -636,9 +659,9 @@ func main() {
 			Handler:      n,
 		}
 
-		logrus.Printf("http server listening on %v", srv.Addr)
+		logrus.Printf("http server listening on %v", frontendHttpServer.Addr)
 		go func() {
-			if err := srv.ListenAndServe(); err != nil {
+			if err := frontendHttpServer.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 				logrus.WithError(err).Fatal("Error serving frontend")
 			}
 		}()
@@ -658,6 +681,15 @@ func main() {
 	}
 
 	utils.WaitForCtrlC()
+
+	if frontendHttpServer != nil {
+		logrus.Infof("shutting down frontendHttpServer")
+		ctx, cancel := context.WithTimeout(context.Background(), time.Second*10)
+		defer cancel()
+		if err := frontendHttpServer.Shutdown(ctx); err != nil {
+			logrus.WithError(err).Error("error shutting down frontend server")
+		}
+	}
 
 	logrus.Println("exiting...")
 }

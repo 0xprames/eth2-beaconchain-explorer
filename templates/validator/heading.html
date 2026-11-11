@@ -36,13 +36,6 @@
               </button>
             </span>
           {{ end }}
-          {{ if (and (ne .Status "deposited") (ne .Status "deposited_invalid") (ne .Status "pending")) }}
-            <span class="mx-1" data-toggle="tooltip" title="View daily statistics">
-              <a class="btn btn-dark text-white btn-sm" href="/validator/{{ .Index }}/stats">
-                <i class="fas fa-table"></i>
-              </a>
-            </span>
-          {{ end }}
         </h1>
       </div>
       <nav aria-label="breadcrumb">
@@ -53,7 +46,6 @@
         </ol>
       </nav>
     </div>
-    {{ if .Tags }}{{ formatValidatorTags .Tags }}{{ end }}
     <div class="text-monospace text-secondary text-truncate text-sm mb-0" id="copy-input">0x{{ printf "%x" .PublicKey }}</div>
   </div>
 {{ end }}

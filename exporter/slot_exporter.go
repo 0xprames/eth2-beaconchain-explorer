@@ -3,14 +3,15 @@ package exporter
 import (
 	"bytes"
 	"database/sql"
-	"eth2-exporter/db"
-	"eth2-exporter/rpc"
-	"eth2-exporter/types"
-	"eth2-exporter/utils"
 	"fmt"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/gobitfly/eth2-beaconchain-explorer/db"
+	"github.com/gobitfly/eth2-beaconchain-explorer/rpc"
+	"github.com/gobitfly/eth2-beaconchain-explorer/types"
+	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
 
 	"github.com/jmoiron/sqlx"
 	"github.com/sirupsen/logrus"
@@ -277,13 +278,6 @@ func ExportSlot(client rpc.Client, slot uint64, isHeadEpoch bool, tx *sqlx.Tx) e
 			}
 			return nil
 		})
-		g.Go(func() error {
-			err := db.BigtableClient.SaveProposalAssignments(epoch, block.EpochAssignments.ProposerAssignments)
-			if err != nil {
-				return fmt.Errorf("error exporting proposal assignments to bigtable: %w", err)
-			}
-			return nil
-		})
 
 		// save the validator balances to bigtable
 		g.Go(func() error {
@@ -375,12 +369,6 @@ func ExportSlot(client rpc.Client, slot uint64, isHeadEpoch bool, tx *sqlx.Tx) e
 	err = db.BigtableClient.SaveSyncComitteeDuties(syncDuties)
 	if err != nil {
 		return fmt.Errorf("error exporting sync committee duties to bigtable for slot %v: %w", block.Slot, err)
-	}
-
-	// save the proposal to bigtable
-	err = db.BigtableClient.SaveProposal(block)
-	if err != nil {
-		return fmt.Errorf("error exporting proposal to bigtable for slot %v: %w", block.Slot, err)
 	}
 
 	// save the block data to the db

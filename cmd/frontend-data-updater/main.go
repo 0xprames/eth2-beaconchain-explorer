@@ -1,17 +1,20 @@
 package main
 
 import (
-	"eth2-exporter/cache"
-	"eth2-exporter/db"
-	"eth2-exporter/price"
-	"eth2-exporter/rpc"
-	"eth2-exporter/services"
-	"eth2-exporter/types"
-	"eth2-exporter/utils"
-	"eth2-exporter/version"
 	"flag"
 	"fmt"
 	"math/big"
+	"sync"
+
+	"github.com/gobitfly/eth2-beaconchain-explorer/cache"
+	"github.com/gobitfly/eth2-beaconchain-explorer/db"
+	"github.com/gobitfly/eth2-beaconchain-explorer/metrics"
+	"github.com/gobitfly/eth2-beaconchain-explorer/price"
+	"github.com/gobitfly/eth2-beaconchain-explorer/rpc"
+	"github.com/gobitfly/eth2-beaconchain-explorer/services"
+	"github.com/gobitfly/eth2-beaconchain-explorer/types"
+	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
+	"github.com/gobitfly/eth2-beaconchain-explorer/version"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/sirupsen/logrus"
@@ -47,10 +50,47 @@ func main() {
 		}()
 	}
 
+	if utils.Config.Metrics.Enabled {
+		go func(addr string) {
+			logrus.Infof("serving metrics on %v", addr)
+			if err := metrics.Serve(addr); err != nil {
+				logrus.WithError(err).Fatal("Error serving metrics")
+			}
+		}(utils.Config.Metrics.Address)
+	}
+
 	_, err = db.InitBigtable(cfg.Bigtable.Project, cfg.Bigtable.Instance, fmt.Sprintf("%d", utils.Config.Chain.ClConfig.DepositChainID), utils.Config.RedisCacheEndpoint)
 	if err != nil {
 		logrus.Fatalf("error initializing bigtable %v", err)
 	}
+
+	wg := &sync.WaitGroup{}
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		db.MustInitFrontendDB(&types.DatabaseConfig{
+			Username:     cfg.Frontend.WriterDatabase.Username,
+			Password:     cfg.Frontend.WriterDatabase.Password,
+			Name:         cfg.Frontend.WriterDatabase.Name,
+			Host:         cfg.Frontend.WriterDatabase.Host,
+			Port:         cfg.Frontend.WriterDatabase.Port,
+			MaxOpenConns: cfg.Frontend.WriterDatabase.MaxOpenConns,
+			MaxIdleConns: cfg.Frontend.WriterDatabase.MaxIdleConns,
+			SSL:          cfg.Frontend.WriterDatabase.SSL,
+		}, &types.DatabaseConfig{
+			Username:     cfg.Frontend.ReaderDatabase.Username,
+			Password:     cfg.Frontend.ReaderDatabase.Password,
+			Name:         cfg.Frontend.ReaderDatabase.Name,
+			Host:         cfg.Frontend.ReaderDatabase.Host,
+			Port:         cfg.Frontend.ReaderDatabase.Port,
+			MaxOpenConns: cfg.Frontend.ReaderDatabase.MaxOpenConns,
+			MaxIdleConns: cfg.Frontend.ReaderDatabase.MaxIdleConns,
+			SSL:          cfg.Frontend.ReaderDatabase.SSL,
+		}, "pgx", "postgres")
+	}()
+	wg.Wait()
+	defer db.FrontendReaderDB.Close()
+	defer db.FrontendWriterDB.Close()
 
 	db.MustInitDB(&types.DatabaseConfig{
 		Username:     cfg.WriterDatabase.Username,
@@ -60,6 +100,7 @@ func main() {
 		Port:         cfg.WriterDatabase.Port,
 		MaxOpenConns: cfg.WriterDatabase.MaxOpenConns,
 		MaxIdleConns: cfg.WriterDatabase.MaxIdleConns,
+		SSL:          cfg.WriterDatabase.SSL,
 	}, &types.DatabaseConfig{
 		Username:     cfg.ReaderDatabase.Username,
 		Password:     cfg.ReaderDatabase.Password,
@@ -68,7 +109,8 @@ func main() {
 		Port:         cfg.ReaderDatabase.Port,
 		MaxOpenConns: cfg.ReaderDatabase.MaxOpenConns,
 		MaxIdleConns: cfg.ReaderDatabase.MaxIdleConns,
-	})
+		SSL:          cfg.ReaderDatabase.SSL,
+	}, "pgx", "postgres")
 	defer db.ReaderDb.Close()
 	defer db.WriterDb.Close()
 

@@ -1,33 +1,38 @@
 package main
 
 import (
-	"eth2-exporter/cache"
-	"eth2-exporter/db"
-	"eth2-exporter/price"
-	"eth2-exporter/rpc"
-	"eth2-exporter/services"
-	"eth2-exporter/types"
-	"eth2-exporter/utils"
-	"eth2-exporter/version"
 	"flag"
 	"fmt"
+	"log"
 	"math/big"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/gobitfly/eth2-beaconchain-explorer/cache"
+	"github.com/gobitfly/eth2-beaconchain-explorer/db"
+	"github.com/gobitfly/eth2-beaconchain-explorer/metrics"
+	"github.com/gobitfly/eth2-beaconchain-explorer/price"
+	"github.com/gobitfly/eth2-beaconchain-explorer/rpc"
+	"github.com/gobitfly/eth2-beaconchain-explorer/services"
+	"github.com/gobitfly/eth2-beaconchain-explorer/types"
+	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
+	"github.com/gobitfly/eth2-beaconchain-explorer/version"
 
 	_ "github.com/jackc/pgx/v5/stdlib"
 	"github.com/sirupsen/logrus"
 )
 
 type options struct {
-	configPath                string
-	statisticsDayToExport     int64
-	statisticsDaysToExport    string
-	statisticsValidatorToggle bool
-	statisticsChartToggle     bool
-	statisticsGraffitiToggle  bool
-	resetStatus               bool
+	configPath                 string
+	statisticsDayToExport      int64
+	statisticsDaysToExport     string
+	statisticsValidatorToggle  bool
+	statisticsChartToggle      bool
+	statisticsGraffitiToggle   bool
+	statisticsDepositsToggle   bool
+	statisticsDepositsInterval time.Duration
+	resetStatus                bool
 }
 
 var opt = &options{}
@@ -39,6 +44,8 @@ func main() {
 	flag.BoolVar(&opt.statisticsValidatorToggle, "validators.enabled", false, "Toggle exporting validator statistics")
 	flag.BoolVar(&opt.statisticsChartToggle, "charts.enabled", false, "Toggle exporting chart series")
 	flag.BoolVar(&opt.statisticsGraffitiToggle, "graffiti.enabled", false, "Toggle exporting graffiti statistics")
+	flag.BoolVar(&opt.statisticsDepositsToggle, "deposits.enabled", false, "Toggle aggregating deposits")
+	flag.DurationVar(&opt.statisticsDepositsInterval, "deposits.interval", time.Hour*24, "Duration to wait between deposit aggregation")
 	flag.BoolVar(&opt.resetStatus, "validators.reset", false, "Export stats independet if they have already been exported previously")
 
 	versionFlag := flag.Bool("version", false, "Show version and exit")
@@ -59,6 +66,15 @@ func main() {
 	}
 	utils.Config = cfg
 
+	if utils.Config.Metrics.Enabled {
+		go func(addr string) {
+			logrus.Infof("serving metrics on %v", addr)
+			if err := metrics.Serve(addr); err != nil {
+				logrus.WithError(err).Fatal("Error serving metrics")
+			}
+		}(utils.Config.Metrics.Address)
+	}
+
 	if utils.Config.Chain.ClConfig.SlotsPerEpoch == 0 || utils.Config.Chain.ClConfig.SecondsPerSlot == 0 {
 		utils.LogFatal(fmt.Errorf("error ether SlotsPerEpoch [%v] or SecondsPerSlot [%v] are not set", utils.Config.Chain.ClConfig.SlotsPerEpoch, utils.Config.Chain.ClConfig.SecondsPerSlot), "", 0)
 		return
@@ -74,6 +90,7 @@ func main() {
 		Port:         cfg.WriterDatabase.Port,
 		MaxOpenConns: cfg.WriterDatabase.MaxOpenConns,
 		MaxIdleConns: cfg.WriterDatabase.MaxIdleConns,
+		SSL:          cfg.WriterDatabase.SSL,
 	}, &types.DatabaseConfig{
 		Username:     cfg.ReaderDatabase.Username,
 		Password:     cfg.ReaderDatabase.Password,
@@ -82,7 +99,8 @@ func main() {
 		Port:         cfg.ReaderDatabase.Port,
 		MaxOpenConns: cfg.ReaderDatabase.MaxOpenConns,
 		MaxIdleConns: cfg.ReaderDatabase.MaxIdleConns,
-	})
+		SSL:          cfg.ReaderDatabase.SSL,
+	}, "pgx", "postgres")
 	defer db.ReaderDb.Close()
 	defer db.WriterDb.Close()
 
@@ -94,6 +112,7 @@ func main() {
 		Port:         cfg.Frontend.WriterDatabase.Port,
 		MaxOpenConns: cfg.Frontend.WriterDatabase.MaxOpenConns,
 		MaxIdleConns: cfg.Frontend.WriterDatabase.MaxIdleConns,
+		SSL:          cfg.Frontend.WriterDatabase.SSL,
 	}, &types.DatabaseConfig{
 		Username:     cfg.Frontend.ReaderDatabase.Username,
 		Password:     cfg.Frontend.ReaderDatabase.Password,
@@ -102,7 +121,8 @@ func main() {
 		Port:         cfg.Frontend.ReaderDatabase.Port,
 		MaxOpenConns: cfg.Frontend.ReaderDatabase.MaxOpenConns,
 		MaxIdleConns: cfg.Frontend.ReaderDatabase.MaxIdleConns,
-	})
+		SSL:          cfg.Frontend.ReaderDatabase.SSL,
+	}, "pgx", "postgres")
 	defer db.FrontendReaderDB.Close()
 	defer db.FrontendWriterDB.Close()
 
@@ -226,6 +246,10 @@ func main() {
 
 	go statisticsLoop(rpcClient)
 
+	if opt.statisticsDepositsToggle {
+		go depositsLoop()
+	}
+
 	utils.WaitForCtrlC()
 
 	logrus.Println("exiting...")
@@ -266,6 +290,7 @@ func statisticsLoop(client rpc.Client) {
 			if lastExportedDayValidator != 0 {
 				lastExportedDayValidator++
 			}
+
 			if lastExportedDayValidator <= previousDay || lastExportedDayValidator == 0 {
 				for day := lastExportedDayValidator; day <= previousDay; day++ {
 					err := db.WriteValidatorStatisticsForDay(day, client)
@@ -303,15 +328,28 @@ func statisticsLoop(client rpc.Client) {
 		}
 
 		if opt.statisticsGraffitiToggle {
-			var lastDay int64
-			err := db.WriterDb.Get(&lastDay, "select COALESCE(max(day), 0) from graffiti_stats")
+			graffitiStatsStatus := []struct {
+				Day    uint64
+				Status bool
+			}{}
+			err := db.WriterDb.Select(&graffitiStatsStatus, "select day, status from graffiti_stats_status")
 			if err != nil {
-				logrus.Errorf("error retreiving latest exported day from graffiti_stats: %v", err)
+				logrus.Errorf("error retrieving graffitiStatsStatus: %v", err)
 			} else {
-				nextDay := lastDay + 1
-				err = db.WriteGraffitiStatisticsForDay(nextDay)
-				if err != nil {
-					logrus.Errorf("error exporting graffiti-stats for day %v: %v", nextDay, err)
+				graffitiStatsStatusMap := map[uint64]bool{}
+				for _, s := range graffitiStatsStatus {
+					graffitiStatsStatusMap[s.Day] = s.Status
+				}
+				for day := uint64(0); day <= currentDay; day++ {
+					if !graffitiStatsStatusMap[day] {
+						logrus.Infof("exporting graffiti-stats for day %v", day)
+						err = db.WriteGraffitiStatisticsForDay(int64(day))
+						if err != nil {
+							logrus.Errorf("error exporting graffiti-stats for day %v: %v", day, err)
+							loopError = err
+							break
+						}
+					}
 				}
 			}
 		}
@@ -322,6 +360,25 @@ func statisticsLoop(client rpc.Client) {
 			services.ReportStatus("statistics", loopError.Error(), nil)
 		}
 		time.Sleep(time.Minute)
+	}
+}
+
+func depositsLoop() {
+	if opt.statisticsDepositsInterval < time.Minute {
+		log.Fatal(nil, "deposits.interval must be at least 1 minute", 0)
+	}
+	time.Sleep(time.Minute) // wait in case the process is in crashloop
+	for {
+		start := time.Now()
+		err := db.AggregateDeposits()
+		if err != nil {
+			logrus.Errorf("error aggregating deposits: %v", err)
+			services.ReportStatus("deposits_aggregator", err.Error(), nil)
+		} else {
+			logrus.WithFields(logrus.Fields{"duration": time.Since(start)}).Infof("aggregated deposits")
+			services.ReportStatus("deposits_aggregator", "Running", nil)
+		}
+		time.Sleep(opt.statisticsDepositsInterval)
 	}
 }
 

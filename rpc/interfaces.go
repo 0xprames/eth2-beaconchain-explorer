@@ -1,8 +1,9 @@
 package rpc
 
 import (
-	"eth2-exporter/types"
 	"math/big"
+
+	"github.com/gobitfly/eth2-beaconchain-explorer/types"
 
 	"github.com/sirupsen/logrus"
 )
@@ -20,6 +21,7 @@ type Client interface {
 	GetBalancesForEpoch(epoch int64) (map[uint64]uint64, error)
 	GetValidatorState(epoch uint64) (*StandardValidatorsResponse, error)
 	GetBlockHeader(slot uint64) (*StandardBeaconHeaderResponse, error)
+	GetPendingDeposits() (*StandardBeaconPendingDepositsResponse, error)
 }
 
 type Eth1Client interface {

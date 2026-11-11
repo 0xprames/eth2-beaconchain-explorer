@@ -2,13 +2,16 @@ package handlers
 
 import (
 	"encoding/json"
-	"eth2-exporter/services"
-	"eth2-exporter/templates"
-	"eth2-exporter/types"
-	"eth2-exporter/utils"
 	"fmt"
 	"math"
 	"net/http"
+	"time"
+
+	"github.com/gobitfly/eth2-beaconchain-explorer/db"
+	"github.com/gobitfly/eth2-beaconchain-explorer/services"
+	"github.com/gobitfly/eth2-beaconchain-explorer/templates"
+	"github.com/gobitfly/eth2-beaconchain-explorer/types"
+	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
 )
 
 // Index will return the main "index" page using a go template
@@ -18,7 +21,6 @@ func Index(w http.ResponseWriter, r *http.Request) {
 		"index/depositProgress.html",
 		"index/depositChart.html",
 		"index/genesis.html",
-		"index/hero.html",
 		"index/networkStats.html",
 		"index/postGenesis.html",
 		"index/preGenesis.html",
@@ -29,6 +31,7 @@ func Index(w http.ResponseWriter, r *http.Request) {
 		"svg/bricks.html",
 		"svg/professor.html",
 		"svg/timeline.html",
+		"components/apiBanner.html",
 		"components/rocket.html",
 		"slotViz.html",
 	)
@@ -46,6 +49,14 @@ func Index(w http.ResponseWriter, r *http.Request) {
 
 	calculateChurn(pageData)
 
+	// Populate treemap data for index page (entity rows only)
+	treemapRows, err := db.GetEntitiesTreemapData("30d")
+	if err != nil {
+		utils.LogError(err, "select index treemap data", 0)
+	} else {
+		pageData.EntitiesTreemap = treemapRows
+	}
+
 	data.Data = pageData
 
 	if handleTemplateError(w, r, "index.go", "Index", "", indexTemplate.ExecuteTemplate(w, "layout", data)) != nil {
@@ -62,7 +73,7 @@ func IndexPageData(w http.ResponseWriter, r *http.Request) {
 
 	if err != nil {
 		logger.Errorf("error sending latest index page data: %v", err)
-		http.Error(w, "Internal server error", http.StatusServiceUnavailable)
+		http.Error(w, "Internal server error", http.StatusInternalServerError)
 		return
 	}
 }
@@ -96,19 +107,49 @@ func getSlotVizData(currentEpoch uint64) *types.SlotVizPageData {
 }
 
 func calculateChurn(page *types.IndexPageData) {
-	limit := services.GetLatestStats().ValidatorChurnLimit
-	pending_validators := services.GetLatestStats().PendingValidatorCount
-	// calculate daily new validators
-	limit_per_day := *limit * uint64(225)
-	// calculate how long it will take for a new deposit to be processed
-	time := float64(*pending_validators) / float64((limit_per_day))
-	const hoursPerDay = 24
-	wholeDays, fractionalDays := math.Modf(time)
+	if utils.ElectraHasHappened(page.CurrentEpoch) {
+		data := services.LatestQueueData()
+		if data == nil {
+			logger.Warn("error getting queue data")
+			return
+		}
+		duration := data.EnteringQueueTime
 
-	hours := int(fractionalDays * hoursPerDay)
+		if duration < 0 {
+			page.NewDepositProcessAfter = "a couple minutes"
+		} else {
+			days := duration / (24 * time.Hour)
+			hours := (duration % (24 * time.Hour)) / time.Hour
+			page.NewDepositProcessAfter = fmt.Sprintf("%d days and %d hours", days, hours)
+		}
+		page.ValidatorsPerEpoch = data.EnteringBalancePerEpoch
+		page.ValidatorsPerDay = data.EnteringBalancePerDay
+	} else {
+		stats := services.GetLatestStats()
+		if stats == nil ||
+			stats.ValidatorActivationChurnLimit == nil ||
+			stats.PendingValidatorCount == nil {
+			logger.Warn("calculateChurn: missing or invalid cached stats; skipping churn calculation")
+			return
+		}
+		limit := *stats.ValidatorActivationChurnLimit
+		if limit == 0 {
+			logger.Warn("calculateChurn: churn limit is zero; skipping churn calculation")
+			return
+		}
+		pending_validators := *stats.PendingValidatorCount
+		// calculate daily new validators
+		limit_per_day := limit * uint64(225)
+		// calculate how long it will take for a new deposit to be processed
+		daysFloat := float64(pending_validators) / float64((limit_per_day))
+		const hoursPerDay = 24
+		wholeDays, fractionalDays := math.Modf(daysFloat)
 
-	time_as_days := fmt.Sprintf("%d days and %d hours", int(wholeDays), hours)
-	page.NewDepositProcessAfter = time_as_days
-	page.ValidatorsPerEpoch = *limit
-	page.ValidatorsPerDay = limit_per_day
+		hours := int(fractionalDays * hoursPerDay)
+
+		time_as_days := fmt.Sprintf("%d days and %d hours", int(wholeDays), hours)
+		page.NewDepositProcessAfter = time_as_days
+		page.ValidatorsPerEpoch = limit
+		page.ValidatorsPerDay = limit_per_day
+	}
 }

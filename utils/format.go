@@ -5,8 +5,6 @@ import (
 	"database/sql"
 	"encoding/base64"
 	"encoding/hex"
-	"eth2-exporter/price"
-	"eth2-exporter/types"
 	"fmt"
 	"html"
 	"html/template"
@@ -17,6 +15,9 @@ import (
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/gobitfly/eth2-beaconchain-explorer/price"
+	"github.com/gobitfly/eth2-beaconchain-explorer/types"
 
 	"github.com/prysmaticlabs/go-bitfield"
 	"github.com/shopspring/decimal"
@@ -29,6 +30,13 @@ import (
 
 	itypes "github.com/gobitfly/eth-rewards/types"
 )
+
+const CalculatingHint = `Calculating…`
+
+func BeginningOfSetWithdrawalCredentials(version int) string {
+	hexVersion := fmt.Sprintf("%02x", version)
+	return fmt.Sprintf("%s0000000000000000000000", hexVersion)
+}
 
 func FormatMessageToHtml(message string) template.HTML {
 	message = fmt.Sprint(strings.Replace(message, "Error: ", "", 1))
@@ -73,13 +81,13 @@ func FormatAttestationStatus(status uint64) template.HTML {
 // FormatAttestationStatusShort will return a user-friendly attestation for an attestation status number
 func FormatAttestationStatusShort(status uint64) template.HTML {
 	if status == 0 {
-		return `<span title="Scheduled" data-toggle="tooltip" class="mx-1 badge badge-pill bg-light text-dark" style="font-size: 12px; font-weight: 500;">Sche.</span>`
+		return `<span title="Scheduled Attestation" data-toggle="tooltip" class="mx-1 badge badge-pill bg-light text-dark" style="font-size: 12px; font-weight: 500;">Sche.</span>`
 	} else if status == 1 {
 		return `<span title="Attested" data-toggle="tooltip" class="mx-1 badge badge-pill bg-success text-white" style="font-size: 12px; font-weight: 500;">Att.</span>`
 	} else if status == 2 {
-		return `<span title="Missed" data-toggle="tooltip" class="mx-1 badge badge-pill bg-warning text-white" style="font-size: 12px; font-weight: 500;">Miss.</span>`
+		return `<span title="Missed Attestation" data-toggle="tooltip" class="mx-1 badge badge-pill bg-warning text-white" style="font-size: 12px; font-weight: 500;">Miss.</span>`
 	} else if status == 3 {
-		return `<span title="Missed (Orphaned)" data-toggle="tooltip" class="mx-1 badge badge-pill bg-warning text-white" style="font-size: 12px; font-weight: 500;">Orph.</span>`
+		return `<span title="Missed Attestation (Orphaned)" data-toggle="tooltip" class="mx-1 badge badge-pill bg-warning text-white" style="font-size: 12px; font-weight: 500;">Orph.</span>`
 	} else if status == 4 {
 		return `<span title="Inactivity Leak" data-toggle="tooltip" class="mx-1 badge badge-pill bg-danger text-white" style="font-size: 12px; font-weight: 500;">Leak</span>`
 	} else if status == 5 {
@@ -105,7 +113,7 @@ func FormatBalance(balanceInt uint64, currency string) template.HTML {
 // FormatBalance will return a string for a balance
 func FormatEligibleBalance(balanceInt uint64, currency string) template.HTML {
 	if balanceInt == 0 {
-		return `<span class="text-small text-muted">Calculating...</span>`
+		return `<span class="text-small text-muted">` + CalculatingHint + `</span>`
 	}
 	exchangeRate := price.GetPrice(Config.Frontend.ClCurrency, currency)
 	balance := FormatFloat((float64(balanceInt)/float64(Config.Frontend.ClCurrencyDivisor))*float64(exchangeRate), 2)
@@ -138,11 +146,6 @@ func FormatBalanceGwei(balance *int64, currency string) template.HTML {
 		return template.HTML(fmt.Sprintf("<span class=\"text-success\">+%.0f GWei</span>", balanceF))
 	}
 	return FormatBalanceChange(balance, currency)
-}
-
-func CurrencyToCl(valIf interface{}, currency string) decimal.Decimal {
-	val := IfToDec(valIf)
-	return val.Mul(decimal.NewFromFloat(price.GetPrice(Config.Frontend.ClCurrency, currency)))
 }
 
 func ClToMainCurrency(valIf interface{}) decimal.Decimal {
@@ -189,44 +192,92 @@ func ClToCurrencyGwei(valIf interface{}, currency string) decimal.Decimal {
 	return val.Mul(decimal.NewFromFloat(price.GetPrice(Config.Frontend.ClCurrency, currency)))
 }
 
-func FormatElCurrency(value interface{}, targetCurrency string, digitsAfterComma int, showCurrencySymbol, showPlusSign, colored bool) template.HTML {
-	return FormatCurrency(ElToCurrency(value, Config.Frontend.ElCurrency), Config.Frontend.ElCurrency, targetCurrency, digitsAfterComma, showCurrencySymbol, showPlusSign, colored)
+func FormatElCurrency(value interface{}, targetCurrency string, digitsAfterComma int, showCurrencySymbol, showPlusSign, colored, truncateAndAddTooltip bool) template.HTML {
+	return formatCurrency(ElToCurrency(value, Config.Frontend.ElCurrency), Config.Frontend.ElCurrency, targetCurrency, digitsAfterComma, showCurrencySymbol, showPlusSign, colored, truncateAndAddTooltip)
 }
 
-func FormatClCurrency(value interface{}, targetCurrency string, digitsAfterComma int, showCurrencySymbol, showPlusSign, colored bool) template.HTML {
-	return FormatCurrency(ClToCurrency(value, Config.Frontend.ClCurrency), Config.Frontend.ClCurrency, targetCurrency, digitsAfterComma, showCurrencySymbol, showPlusSign, colored)
+func FormatClCurrency(value interface{}, targetCurrency string, digitsAfterComma int, showCurrencySymbol, showPlusSign, colored, truncateAndAddTooltip bool) template.HTML {
+	return formatCurrency(ClToCurrency(value, Config.Frontend.ClCurrency), Config.Frontend.ClCurrency, targetCurrency, digitsAfterComma, showCurrencySymbol, showPlusSign, colored, truncateAndAddTooltip)
 }
 
-func FormatCurrency(valIf interface{}, valueCurrency, targetCurrency string, digitsAfterComma int, showCurrencySymbol, showPlusSign, colored bool) template.HTML {
+func FormatElCurrencyString(value interface{}, targetCurrency string, digitsAfterComma int, showCurrencySymbol, showPlusSign, truncateAndAddTooltip bool) string {
+	return formatCurrencyString(ElToCurrency(value, Config.Frontend.ElCurrency), Config.Frontend.ElCurrency, targetCurrency, digitsAfterComma, showCurrencySymbol, showPlusSign, truncateAndAddTooltip)
+}
+
+func FormatClCurrencyString(value interface{}, targetCurrency string, digitsAfterComma int, showCurrencySymbol, showPlusSign, truncateAndAddTooltip bool) string {
+	return formatCurrencyString(ClToCurrency(value, Config.Frontend.ClCurrency), Config.Frontend.ClCurrency, targetCurrency, digitsAfterComma, showCurrencySymbol, showPlusSign, truncateAndAddTooltip)
+}
+
+func formatCurrencyString(valIf interface{}, valueCurrency, targetCurrency string, digitsAfterComma int, showCurrencySymbol, showPlusSign, truncateAndAddTooltip bool) string {
 	val := IfToDec(valIf)
+
 	valPriced := val
 	if valueCurrency != targetCurrency {
 		valPriced = val.Mul(decimal.NewFromFloat(price.GetPrice(valueCurrency, targetCurrency)))
 	}
-	var resStr string
+
+	currencyStr := ""
 	if showCurrencySymbol {
-		resStr = fmt.Sprintf("%s %s", valPriced.StringFixed(int32(digitsAfterComma)), price.GetCurrencySymbol(targetCurrency))
-	} else {
-		resStr = valPriced.StringFixed(int32(digitsAfterComma))
+		currencyStr = " " + price.GetCurrencySymbol(targetCurrency)
 	}
 
-	classes := ""
-	plusSign := ""
+	amountStr := ""
+	tooltipStartStr := ""
+	tooltipEndStr := ""
+	if truncateAndAddTooltip {
+		amountStr = valPriced.Truncate(int32(digitsAfterComma)).String()
 
-	if valPriced.Cmp(decimal.NewFromInt(0)) >= 0 {
-		if showPlusSign {
-			plusSign = "+"
+		// only add tooltip if the value is actually truncated
+		valStr := valPriced.String()
+		if valStr != amountStr {
+			tooltipStartStr = fmt.Sprintf(`<span data-toggle="tooltip" data-placement="top" title="%s%s">`, valPriced, currencyStr)
+			tooltipEndStr = `</span>`
 		}
-		if colored {
-			classes = ` class="text-success"`
+
+		// add trailing zeros to always have the same amount of digits after the comma
+		dotIndex := strings.Index(valStr, ".")
+		if dotIndex >= 0 {
+			if !strings.Contains(amountStr, ".") {
+				amountStr += "."
+			}
+			missingZeros := digitsAfterComma - (len(amountStr) - dotIndex - 1)
+			if missingZeros > 0 {
+				amountStr += strings.Repeat("0", missingZeros)
+			}
 		}
 	} else {
-		if colored {
+		amountStr = valPriced.StringFixed(int32(digitsAfterComma))
+	}
+
+	// apply thousands separators (English) while preserving sign
+	if strings.HasPrefix(amountStr, "-") {
+		amountStr = "-" + FormatThousandsEnglish(amountStr[1:])
+	} else {
+		amountStr = FormatThousandsEnglish(amountStr)
+	}
+
+	plusSignStr := ""
+	if showPlusSign && valPriced.Cmp(decimal.NewFromInt(0)) >= 0 {
+		plusSignStr = "+"
+	}
+
+	return fmt.Sprintf(`%s%s%s%s%s`, tooltipStartStr, plusSignStr, amountStr, currencyStr, tooltipEndStr)
+}
+
+func formatCurrency(valIf interface{}, valueCurrency, targetCurrency string, digitsAfterComma int, showCurrencySymbol, showPlusSign, colored, truncateAndAddTooltip bool) template.HTML {
+	result := formatCurrencyString(valIf, valueCurrency, targetCurrency, digitsAfterComma, showCurrencySymbol, showPlusSign, truncateAndAddTooltip)
+	classes := ""
+
+	if colored {
+		val := IfToDec(valIf)
+		if val.Cmp(decimal.NewFromInt(0)) >= 0 {
+			classes = ` class="text-success"`
+		} else {
 			classes = ` class="text-danger"`
 		}
 	}
 
-	return template.HTML(fmt.Sprintf(`<span%s>%s%s</span>`, classes, plusSign, resStr))
+	return template.HTML(fmt.Sprintf(`<span%s>%s</span>`, classes, result))
 }
 
 // IfToDec trys to parse given parameter to decimal.Decimal, it only logs on error
@@ -257,7 +308,7 @@ func IfToDec(valIf interface{}) decimal.Decimal {
 	return val
 }
 
-func FormatBalanceChangeFormated(balance *int64, currencyName string, details *itypes.ValidatorEpochIncome) template.HTML {
+func FormatBalanceChangeFormatted(balance *int64, currencyName string, details *itypes.ValidatorEpochIncome) template.HTML {
 	currencySymbol := "GWei"
 	currencyFunc := ClToCurrencyGwei
 	if currencyName != Config.Frontend.MainCurrency {
@@ -273,49 +324,49 @@ func FormatBalanceChangeFormated(balance *int64, currencyName string, details *i
 
 	income := ""
 	if details != nil {
-		income += fmt.Sprintf("Att. Source: %s %s<br/>", FormatAddCommasFormated(currencyFunc(details.AttestationSourceReward-details.AttestationSourcePenalty, currencyName).InexactFloat64(), maxDigits), currencySymbol)
-		income += fmt.Sprintf("Att. Target: %s %s<br/>", FormatAddCommasFormated(currencyFunc(details.AttestationTargetReward-details.AttestationTargetPenalty, currencyName).InexactFloat64(), maxDigits), currencySymbol)
-		income += fmt.Sprintf("Att. Head Vote: %s %s<br/>", FormatAddCommasFormated(currencyFunc(details.AttestationHeadReward, currencyName).InexactFloat64(), maxDigits), currencySymbol)
+		income += fmt.Sprintf("Att. Source: %s %s<br/>", FormatAddCommasFormatted(currencyFunc(IfToDec(details.AttestationSourceReward).Sub(IfToDec(details.AttestationSourcePenalty)), currencyName).InexactFloat64(), maxDigits), currencySymbol)
+		income += fmt.Sprintf("Att. Target: %s %s<br/>", FormatAddCommasFormatted(currencyFunc(IfToDec(details.AttestationTargetReward).Sub(IfToDec(details.AttestationTargetPenalty)), currencyName).InexactFloat64(), maxDigits), currencySymbol)
+		income += fmt.Sprintf("Att. Head Vote: %s %s<br/>", FormatAddCommasFormatted(currencyFunc(details.AttestationHeadReward, currencyName).InexactFloat64(), maxDigits), currencySymbol)
 
 		if details.FinalityDelayPenalty > 0 {
-			income += fmt.Sprintf("Finality Delay Penalty: %s %s<br/>", FormatAddCommasFormated(currencyFunc(details.FinalityDelayPenalty, currencyName).InexactFloat64()*-1, maxDigits), currencySymbol)
+			income += fmt.Sprintf("Finality Delay Penalty: %s %s<br/>", FormatAddCommasFormatted(currencyFunc(details.FinalityDelayPenalty, currencyName).InexactFloat64()*-1, maxDigits), currencySymbol)
 		}
 
 		if details.ProposerSlashingInclusionReward > 0 {
-			income += fmt.Sprintf("Proposer Slashing Inc. Reward: %s %s<br/>", FormatAddCommasFormated(currencyFunc(details.ProposerSlashingInclusionReward, currencyName).InexactFloat64(), maxDigits), currencySymbol)
+			income += fmt.Sprintf("Proposer Slashing Inc. Reward: %s %s<br/>", FormatAddCommasFormatted(currencyFunc(details.ProposerSlashingInclusionReward, currencyName).InexactFloat64(), maxDigits), currencySymbol)
 		}
 
 		if details.ProposerAttestationInclusionReward > 0 {
-			income += fmt.Sprintf("Proposer Att. Inc. Reward: %s %s<br/>", FormatAddCommasFormated(currencyFunc(details.ProposerAttestationInclusionReward, currencyName).InexactFloat64(), maxDigits), currencySymbol)
+			income += fmt.Sprintf("Proposer Att. Inc. Reward: %s %s<br/>", FormatAddCommasFormatted(currencyFunc(details.ProposerAttestationInclusionReward, currencyName).InexactFloat64(), maxDigits), currencySymbol)
 		}
 
 		if details.ProposerSyncInclusionReward > 0 {
-			income += fmt.Sprintf("Proposer Sync Inc. Reward: %s %s<br/>", FormatAddCommasFormated(currencyFunc(details.ProposerSyncInclusionReward, currencyName).InexactFloat64(), maxDigits), currencySymbol)
+			income += fmt.Sprintf("Proposer Sync Inc. Reward: %s %s<br/>", FormatAddCommasFormatted(currencyFunc(details.ProposerSyncInclusionReward, currencyName).InexactFloat64(), maxDigits), currencySymbol)
 		}
 
 		if details.SyncCommitteeReward > 0 {
-			income += fmt.Sprintf("Sync Comm. Reward: %s %s<br/>", FormatAddCommasFormated(currencyFunc(details.SyncCommitteeReward, currencyName).InexactFloat64(), maxDigits), currencySymbol)
+			income += fmt.Sprintf("Sync Comm. Reward: %s %s<br/>", FormatAddCommasFormatted(currencyFunc(details.SyncCommitteeReward, currencyName).InexactFloat64(), maxDigits), currencySymbol)
 		}
 
 		if details.SyncCommitteePenalty > 0 {
-			income += fmt.Sprintf("Sync Comm. Penalty: %s %s<br/>", FormatAddCommasFormated(currencyFunc(details.SyncCommitteePenalty, currencyName).InexactFloat64()*-1, maxDigits), currencySymbol)
+			income += fmt.Sprintf("Sync Comm. Penalty: %s %s<br/>", FormatAddCommasFormatted(currencyFunc(details.SyncCommitteePenalty, currencyName).InexactFloat64()*-1, maxDigits), currencySymbol)
 		}
 
 		if details.SlashingReward > 0 {
-			income += fmt.Sprintf("Slashing Reward: %s %s<br/>", FormatAddCommasFormated(currencyFunc(details.SlashingReward, currencyName).InexactFloat64(), maxDigits), currencySymbol)
+			income += fmt.Sprintf("Slashing Reward: %s %s<br/>", FormatAddCommasFormatted(currencyFunc(details.SlashingReward, currencyName).InexactFloat64(), maxDigits), currencySymbol)
 		}
 
 		if details.SlashingPenalty > 0 {
-			income += fmt.Sprintf("Slashing Penalty: %s %s<br/>", FormatAddCommasFormated(currencyFunc(details.SlashingPenalty, currencyName).InexactFloat64()*-1, maxDigits), currencySymbol)
+			income += fmt.Sprintf("Slashing Penalty: %s %s<br/>", FormatAddCommasFormatted(currencyFunc(details.SlashingPenalty, currencyName).InexactFloat64()*-1, maxDigits), currencySymbol)
 		}
 
-		income += fmt.Sprintf("Total: %s %s", FormatAddCommasFormated(currencyFunc(details.TotalClRewards(), currencyName).InexactFloat64(), maxDigits), currencySymbol)
+		income += fmt.Sprintf("Total: %s %s", FormatAddCommasFormatted(currencyFunc(details.TotalClRewards(), currencyName).InexactFloat64(), maxDigits), currencySymbol)
 	}
 
 	if *balance < 0 {
-		return template.HTML(fmt.Sprintf("<span title='%s' data-html=\"true\" data-toggle=\"tooltip\" class=\"text-danger float-right\">%s %s</span>", income, FormatAddCommasFormated(currencyFunc(*balance, currencyName).InexactFloat64(), maxDigits), currencySymbol))
+		return template.HTML(fmt.Sprintf("<span title='%s' data-html=\"true\" data-toggle=\"tooltip\" class=\"text-danger float-right\">%s %s</span>", income, FormatAddCommasFormatted(currencyFunc(*balance, currencyName).InexactFloat64(), maxDigits), currencySymbol))
 	}
-	return template.HTML(fmt.Sprintf("<span title='%s' data-html=\"true\" data-toggle=\"tooltip\" class=\"text-success float-right\">+%s %s</span>", income, FormatAddCommasFormated(currencyFunc(*balance, currencyName).InexactFloat64(), maxDigits), currencySymbol))
+	return template.HTML(fmt.Sprintf("<span title='%s' data-html=\"true\" data-toggle=\"tooltip\" class=\"text-success float-right\">+%s %s</span>", income, FormatAddCommasFormatted(currencyFunc(*balance, currencyName).InexactFloat64(), maxDigits), currencySymbol))
 }
 
 // FormatBalanceChange will return a string for a balance change
@@ -325,9 +376,9 @@ func FormatBalanceChange(balance *int64, currency string) template.HTML {
 			return template.HTML("<span> 0 " + currency + "</span>")
 		}
 		if *balance < 0 {
-			return template.HTML(fmt.Sprintf("<span class=\"text-danger float-right\">%s GWei</span>", FormatAddCommasFormated(ClToCurrencyGwei(*balance, currency).InexactFloat64(), 0)))
+			return template.HTML(fmt.Sprintf("<span class=\"text-danger float-right\">%s GWei</span>", FormatAddCommasFormatted(ClToCurrencyGwei(*balance, currency).InexactFloat64(), 0)))
 		}
-		return template.HTML(fmt.Sprintf("<span class=\"text-success float-right\">+%s GWei</span>", FormatAddCommasFormated(ClToCurrencyGwei(*balance, currency).InexactFloat64(), 0)))
+		return template.HTML(fmt.Sprintf("<span class=\"text-success float-right\">+%s GWei</span>", FormatAddCommasFormatted(ClToCurrencyGwei(*balance, currency).InexactFloat64(), 0)))
 	}
 	if balance == nil {
 		return template.HTML("<span> 0 " + currency + "</span>")
@@ -384,7 +435,7 @@ func FormatFloatWithDigitsString(num float64, min, max int) string {
 	return b[0] + "." + b[1][:idx+min]
 }
 
-func FormatAddCommasFormated(num float64, precision uint) template.HTML {
+func FormatAddCommasFormatted(num float64, precision uint) template.HTML {
 	p := message.NewPrinter(language.English)
 	s := p.Sprintf(fmt.Sprintf("%%.%vf", precision), num)
 	if precision > 0 {
@@ -394,7 +445,7 @@ func FormatAddCommasFormated(num float64, precision uint) template.HTML {
 }
 
 func FormatBigNumberAddCommasFormated(val hexutil.Big, precision uint) template.HTML {
-	return FormatAddCommasFormated(float64(val.ToInt().Int64()), 0)
+	return FormatAddCommasFormatted(float64(val.ToInt().Int64()), 0)
 }
 
 func FormatAddCommas(n uint64) template.HTML {
@@ -448,8 +499,9 @@ func FormatSlotToTimestamp(blockSlot uint64) template.HTML {
 
 // FormatBlockStatus will return an html status for a block.
 func FormatBlockStatus(status, slot uint64) template.HTML {
-	// genesis <span class="badge text-dark" style="background: rgba(179, 159, 70, 0.8) none repeat scroll 0% 0%;">Genesis</span>
-	if status == 0 && SlotToTime(slot).Before(time.Now().Add(time.Minute*-1)) {
+	if slot == 0 {
+		return `<span class="badge badge-pill text-dark" style="background: rgba(179, 159, 70, 0.8); font-size: 12px; font-weight: 500;">Genesis</span>`
+	} else if status == 0 && SlotToTime(slot).Before(time.Now().Add(time.Minute*-1)) {
 		return `<span class="badge badge-pill bg-light text-dark" style="font-size: 12px; font-weight: 500;">Missed</span>`
 	} else if status == 0 {
 		return `<span class="badge badge-pill bg-light text-dark" style="font-size: 12px; font-weight: 500;">Scheduled</span>`
@@ -468,15 +520,15 @@ func FormatBlockStatus(status, slot uint64) template.HTML {
 func FormatBlockStatusShort(status, slot uint64) template.HTML {
 	// genesis <span class="badge text-dark" style="background: rgba(179, 159, 70, 0.8) none repeat scroll 0% 0%;">Genesis</span>
 	if status == 0 && SlotToTime(slot).Before(time.Now().Add(time.Minute*-1)) {
-		return `<span title="Scheduled" data-toggle="tooltip" class="mx-1 badge badge-pill bg-light text-dark" style="font-size: 12px; font-weight: 500;">Miss.</span>`
+		return `<span title="Scheduled Block" data-toggle="tooltip" class="mx-1 badge badge-pill bg-light text-dark" style="font-size: 12px; font-weight: 500;">Miss.</span>`
 	} else if status == 0 {
-		return `<span title="Scheduled" data-toggle="tooltip" class="mx-1 badge badge-pill bg-light text-dark" style="font-size: 12px; font-weight: 500;">Sche.</span>`
+		return `<span title="Scheduled Block" data-toggle="tooltip" class="mx-1 badge badge-pill bg-light text-dark" style="font-size: 12px; font-weight: 500;">Sche.</span>`
 	} else if status == 1 {
-		return `<span title="Proposed" data-toggle="tooltip" class="mx-1 badge badge-pill bg-success text-white" style="font-size: 12px; font-weight: 500;">Prop.</span>`
+		return `<span title="Proposed Block" data-toggle="tooltip" class="mx-1 badge badge-pill bg-success text-white" style="font-size: 12px; font-weight: 500;">Prop.</span>`
 	} else if status == 2 {
-		return `<span title="Missed" data-toggle="tooltip" class="mx-1 badge badge-pill bg-warning text-white" style="font-size: 12px; font-weight: 500;">Miss.</span>`
+		return `<span title="Missed Block" data-toggle="tooltip" class="mx-1 badge badge-pill bg-warning text-white" style="font-size: 12px; font-weight: 500;">Miss.</span>`
 	} else if status == 3 {
-		return `<span title="Missed (Orphaned)" data-toggle="tooltip" class="mx-1 badge badge-pill bg-secondary text-white" style="font-size: 12px; font-weight: 500;">Orph.</span>`
+		return `<span title="Missed Block (Orphaned)" data-toggle="tooltip" class="mx-1 badge badge-pill bg-secondary text-white" style="font-size: 12px; font-weight: 500;">Orph.</span>`
 	} else {
 		return "Unknown"
 	}
@@ -497,6 +549,8 @@ func FormatTransactionType(txnType uint8) string {
 		return "2 (EIP-1559)"
 	case 3:
 		return "3 (Blob, EIP-4844)"
+	case 4:
+		return "4 (Set EOA, EIP-7702)"
 	default:
 		return fmt.Sprintf("%v (???)", txnType)
 	}
@@ -511,7 +565,22 @@ func FormatCurrentBalance(balanceInt uint64, currency string) template.HTML {
 func FormatDepositAmount(balanceInt uint64, currency string) template.HTML {
 	exchangeRate := price.GetPrice(Config.Frontend.ClCurrency, currency)
 	balance := float64(balanceInt) / float64(Config.Frontend.ClCurrencyDivisor)
-	return template.HTML(fmt.Sprintf("%.0f %v", balance*exchangeRate, currency))
+	amount := balance * exchangeRate
+
+	// scale by 10^8 for precision
+	const scale = 1e8
+	scaled := big.NewInt(int64(amount * scale))
+
+	decimals := 6
+	if currency != Config.Frontend.ClCurrency {
+		decimals = 4
+	}
+	trimmed, full := trimAmount(scaled, 8, 0, decimals, false)
+
+	return template.HTML(fmt.Sprintf(
+		`<span data-toggle="tooltip" title="%v %s">%s %[2]s</span>`,
+		full, currency, trimmed,
+	))
 }
 
 // FormatEffectiveBalance will return the effective balance formated as string with 1 digit after the comma
@@ -552,16 +621,16 @@ func FormatEth1BlockHash(block []byte) template.HTML {
 // FormatEth1TxHash will return the eth1-tx-hash formated as html
 func FormatEth1TxHash(hash []byte) template.HTML {
 	copyBtn := CopyButton(hex.EncodeToString(hash))
-	return template.HTML(fmt.Sprintf(`<i class="fas fa-male mr-2"></i><a style="font-family: 'Roboto Mono'" href="/tx/0x%x">0x%v…</a>%v`, hash, hex.EncodeToString(hash)[:6], copyBtn))
+	return template.HTML(fmt.Sprintf(`<i class="fas fa-user-shield mr-2"></i><a style="font-family: 'Roboto Mono'" href="/tx/0x%x">0x%v…</a>%v`, hash, hex.EncodeToString(hash)[:6], copyBtn))
 }
 
 // FormatGlobalParticipationRate will return the global-participation-rate formated as html
 func FormatGlobalParticipationRate(e uint64, r float64, currency string) template.HTML {
 	if e == 0 {
-		return `<span class="text-small text-muted">Calculating...</span>`
+		return `<span class="text-small text-muted">` + CalculatingHint + `</span>`
 	}
 	p := message.NewPrinter(language.English)
-	rr := fmt.Sprintf("%.2f%%", r*100)
+	rr := fmt.Sprintf("%v%%", math.Round(r*10000)/100)
 	tpl := `
 	<div style="position:relative;width:inherit;height:inherit;">
 	  %.0[1]f <small class="text-muted ml-3">(%[2]v)</small>
@@ -570,6 +639,18 @@ func FormatGlobalParticipationRate(e uint64, r float64, currency string) templat
 	  </div>
 	</div>`
 	return template.HTML(p.Sprintf(tpl, float64(e)/float64(Config.Frontend.ClCurrencyDivisor)*price.GetPrice(Config.Frontend.ClCurrency, currency), rr))
+}
+
+// When 'finalized' is false and 'count' is 0, a in-progress hint is returned (three dots if 'shortenCalcHint' is true)
+// If 'count' is positive or 'finalized' is true, 'count' is returned as a string
+func FormatCount(count uint64, finalized bool, shortenCalcHint bool) template.HTML {
+	if finalized || count > 0 {
+		return template.HTML(fmt.Sprintf("%v", count))
+	}
+	if shortenCalcHint {
+		return template.HTML("…")
+	}
+	return template.HTML(CalculatingHint)
 }
 
 func FormatEtherValue(currency string, ethPrice decimal.Decimal, currentPrice template.HTML) template.HTML {
@@ -609,16 +690,22 @@ func FormatGraffitiAsLink(graffiti []byte) template.HTML {
 	return template.HTML(fmt.Sprintf("<span aria-graffiti=\"%#x\"><a href=\"/slots?q=%s\">%s</a></span>", graffiti, u, h))
 }
 
-// FormatHash will return a hash formated as html
-// hash is required, trunc is optional.
-// Only the first value in trunc_opt will be used.
+/*
+  - FormatHash will return a hash formated as html
+    hash is required, trunc is optional.
+    Only the first value in trunc_opt will be used.
+    ATTENTION: IT TRUNCATES BY DEFAULT, PASS FALSE TO trunc_opt TO DISABLE
+*/
 func FormatHash(hash []byte, trunc_opt ...bool) template.HTML {
 	return template.HTML(fmt.Sprintf("<span class=\"text-monospace\">%s</span>", FormatHashRaw(hash, trunc_opt...)))
 }
 
-// FormatHashRaw will return a hash formated
-// hash is required, trunc is optional.
-// Only the first value in trunc_opt will be used.
+/*
+  - FormatHashRaw will return a hash formated
+    hash is required, trunc is optional.
+    Only the first value in trunc_opt will be used.
+    ATTENTION: IT TRUNCATES BY DEFAULT, PASS FALSE TO trunc_opt TO DISABLE
+*/
 func FormatHashRaw(hash []byte, trunc_opt ...bool) string {
 	s := fmt.Sprintf("%#x", hash)
 	if len(s) == 42 { // if it's an address, we checksum it (0x + 40)
@@ -632,18 +719,27 @@ func FormatHashRaw(hash []byte, trunc_opt ...bool) string {
 
 // WithdrawalCredentialsToAddress converts withdrawalCredentials to an address if possible
 func WithdrawalCredentialsToAddress(credentials []byte) ([]byte, error) {
-	if IsValidWithdrawalCredentials(fmt.Sprintf("%#x", credentials)) && bytes.Equal(credentials[:1], []byte{0x01}) {
+	if IsValidWithdrawalCredentials(fmt.Sprintf("%#x", credentials)) && (bytes.Equal(credentials[:1], []byte{0x01}) || bytes.Equal(credentials[:1], []byte{0x02})) {
 		return credentials[12:], nil
 	}
 	return nil, fmt.Errorf("invalid withdrawal credentials")
 }
 
 // AddressToWithdrawalCredentials converts a valid address to withdrawalCredentials
-func AddressToWithdrawalCredentials(address []byte) ([]byte, error) {
+func AddressToWithdrawalCredentials(address []byte) ([][]byte, error) {
 	if IsValidEth1Address(fmt.Sprintf("%#x", address)) {
-		credentials := make([]byte, 12, 32)
-		credentials[0] = 0x01
-		credentials = append(credentials, address...)
+		credentials := make([][]byte, 2)
+
+		zeroOneCredentials := make([]byte, 12, 32)
+		zeroOneCredentials[0] = 0x01
+		zeroOneCredentials = append(zeroOneCredentials, address...)
+		credentials[0] = zeroOneCredentials
+
+		zeroTwoCredentials := make([]byte, 12, 32)
+		zeroTwoCredentials[0] = 0x02
+		zeroTwoCredentials = append(zeroTwoCredentials, address...)
+		credentials[1] = zeroTwoCredentials
+
 		return credentials, nil
 	}
 	return nil, fmt.Errorf("invalid eth1 address")
@@ -660,7 +756,7 @@ func FormatHashWithCopy(hash []byte) template.HTML {
 
 func formatWithdrawalHash(hash []byte) template.HTML {
 	var colorClass string
-	if hash[0] == 0x01 {
+	if hash[0] == 0x01 || hash[0] == 0x02 {
 		colorClass = "text-success"
 	} else {
 		colorClass = "text-warning"
@@ -675,7 +771,7 @@ func FormatWithdawalCredentials(hash []byte, addCopyButton bool) template.HTML {
 	}
 
 	var text template.HTML
-	if hash[0] == 0x01 {
+	if hash[0] == 0x01 || hash[0] == 0x02 {
 		text = template.HTML(fmt.Sprintf("<a href=\"/address/0x%x\">%s</a>", hash[12:], formatWithdrawalHash(hash)))
 	} else {
 		text = formatWithdrawalHash(hash)
@@ -688,8 +784,8 @@ func FormatWithdawalCredentials(hash []byte, addCopyButton bool) template.HTML {
 	return text
 }
 
-func FormatAddressToWithdrawalCredentials(address []byte, addCopyButton bool) template.HTML {
-	credentials, err := hex.DecodeString("010000000000000000000000")
+func FormatAddressToWithdrawalCredentials(address []byte, addCopyButton bool, version int) template.HTML {
+	credentials, err := hex.DecodeString(BeginningOfSetWithdrawalCredentials(version))
 	if err != nil {
 		return "INVALID CREDENTIALS"
 	}
@@ -708,6 +804,22 @@ func CopyButton(clipboardText interface{}) string {
 
 func CopyButtonText(clipboardText interface{}) string {
 	return fmt.Sprintf(`<i class="fa fa-copy text-muted ml-2 p-1" role="button" data-toggle="tooltip" title="Copy to clipboard" data-clipboard-text=%v></i>`, clipboardText)
+}
+
+func FormatCommitteeBitList(b []byte) template.HTML {
+	if len(b) == 0 {
+		return template.HTML("")
+	}
+
+	committeeBits := bitfield.Bitvector64(b)
+	h := template.HTML("<div class=\"text-bitfield text-monospace\">")
+	for i := uint64(0); i < committeeBits.Len(); i++ {
+		if committeeBits.BitAt(i) {
+			h += template.HTML(fmt.Sprintf("%d ", i))
+		}
+	}
+	h += template.HTML("</div>")
+	return h
 }
 
 func FormatBitlist(b []byte) template.HTML {
@@ -797,11 +909,11 @@ func FormatIncomeClEl(income types.ClEl, currency string) template.HTML {
 			<b>%s</b>
 		</span>`,
 			className,
-			FormatElCurrency(income.Cl, currency, 5, true, true, false),
-			FormatElCurrency(income.El, currency, 5, true, true, false), // we use FormatElCurrency here because all values in income-struct are in el-currency
-			FormatElCurrency(income.Total, currency, 5, true, true, false)))
+			FormatElCurrency(income.Cl, currency, 5, true, true, false, false),
+			FormatElCurrency(income.El, currency, 5, true, true, false, false), // we use FormatElCurrency here because all values in income-struct are in el-currency
+			FormatElCurrency(income.Total, currency, 5, true, true, false, false)))
 	} else {
-		return template.HTML(fmt.Sprintf(`<span><b>%s</b></span>`, FormatElCurrency(income.Total, currency, 5, true, true, false)))
+		return template.HTML(fmt.Sprintf(`<span><b>%s</b></span>`, FormatElCurrency(income.Total, currency, 5, true, true, false, false)))
 	}
 }
 
@@ -822,8 +934,8 @@ func FormatIncomeClElInt64(income types.ClElInt64, currency string) template.HTM
 			<b>%s %s</b>
 		</span>`,
 			className,
-			FormatClCurrency(income.Cl, currency, 5, true, true, false),
-			FormatClCurrency(income.El, currency, 5, true, true, false), // we use FormatClCurrency here because all values in income-struct are in Gwei
+			FormatClCurrency(income.Cl, currency, 5, true, true, false, false),
+			FormatClCurrency(income.El, currency, 5, true, true, false, false), // we use FormatClCurrency here because all values in income-struct are in Gwei
 			incomeTrimmed,
 			currency))
 	} else {
@@ -913,8 +1025,7 @@ func FormatPercentageWithGPrecision(percentage float64, precision int) string {
 // FormatPublicKey will return html formatted text for a validator-public-key
 func FormatPublicKey(validator []byte) template.HTML {
 	copyBtn := CopyButton(hex.EncodeToString(validator))
-	// return template.HTML(fmt.Sprintf("<i class=\"fas fa-male\"></i> <a href=\"/validator/0x%x\">%v</a>", validator, FormatHash(validator)))
-	return template.HTML(fmt.Sprintf(`<i class="fas fa-male mr-2"></i><a style="font-family: 'Roboto Mono'" href="/validator/0x%x">0x%v…</a>%v`, validator, hex.EncodeToString(validator)[:6], copyBtn))
+	return template.HTML(fmt.Sprintf(`<i class="fas fa-user-shield mr-2"></i><a style="font-family: 'Roboto Mono'" href="/validator/0x%x">0x%v…</a>%v`, validator, hex.EncodeToString(validator)[:6], copyBtn))
 }
 
 func FormatMachineName(machineName string) template.HTML {
@@ -1019,9 +1130,8 @@ func FormatValidatorTags(tags []string) template.HTML {
 
 // FormatValidator will return html formatted text for a validator
 func FormatValidator(validator uint64) template.HTML {
-	return template.HTML(fmt.Sprintf("<i class=\"fas fa-male mr-2\"></i><a href=\"/validator/%v\">%v</a>", validator, validator))
+	return template.HTML(fmt.Sprintf("<a class=\"val-link\" href=\"/validator/%v\">%v</a>", validator, validator))
 }
-
 func FormatValidatorWithName(validator interface{}, name string) template.HTML {
 	var validatorRead string
 	var validatorLink string
@@ -1037,14 +1147,18 @@ func FormatValidatorWithName(validator interface{}, name string) template.HTML {
 	}
 
 	if name != "" {
-		return template.HTML(fmt.Sprintf("<i class=\"fas fa-male mr-2\"></i> <a href=\"/validator/%v\"><span class=\"text-truncate\">"+html.EscapeString(name)+"</span></a>", validatorLink))
+		return template.HTML(fmt.Sprintf("<i class=\"fas fa-user-shield mr-2\"></i> <a href=\"/validator/%v\"><span class=\"text-truncate\">"+html.EscapeString(name)+"</span></a>", validatorLink))
 	} else {
-		return template.HTML(fmt.Sprintf("<i class=\"fas fa-male mr-2\"></i> <a href=\"/validator/%v\">%v</a>", validatorLink, validatorRead))
+		return template.HTML(fmt.Sprintf("<i class=\"fas fa-user-shield mr-2\"></i> <a href=\"/validator/%v\">%v</a>", validatorLink, validatorRead))
 	}
 }
 
 // FormatValidatorInt64 will return html formatted text for a validator (for an int64 validator-id)
+// Returns "-" if the validator index is less than 0
 func FormatValidatorInt64(validator int64) template.HTML {
+	if validator < 0 {
+		return "-"
+	}
 	return FormatValidator(uint64(validator))
 }
 
@@ -1100,7 +1214,7 @@ func FormatYesNo(yes bool) template.HTML {
 
 func FormatValidatorName(name string) template.HTML {
 	str := strings.Map(fixUtf, template.HTMLEscapeString(name))
-	return template.HTML(fmt.Sprintf("<b><abbr title=\"This name has been set by the owner of this validator. Pool tags have been set by the beaconcha.in team.\">%s</abbr></b>", str))
+	return template.HTML(fmt.Sprintf("<b><abbr title=\"This name has been set by the owner of this validator. Entity tags have been set by the beaconcha.in team.\">%s</abbr></b>", str))
 }
 
 func FormatAttestationInclusionEffectiveness(eff float64) template.HTML {
@@ -1108,13 +1222,60 @@ func FormatAttestationInclusionEffectiveness(eff float64) template.HTML {
 	if eff == 0 {
 		return template.HTML(`<span class="text-danger" data-toggle="tooltip" title="Validator did not attest during the last 100 epochs"> N/A <i class="fas fa-frown"></i>`)
 	} else if eff >= 100 {
-		return template.HTML(fmt.Sprintf(`<span class="text-success" data-toggle="tooltip" title="%s"> %.0f%% - Perfect <i class="fas fa-grin-stars"></i>`, tooltipText, eff))
+		return template.HTML(fmt.Sprintf(`<span class="text-success" data-toggle="tooltip" title="%s"> %.0f%% - Perfect <i class="fas fa-grin-stars"></i></span>`, tooltipText, eff))
 	} else if eff > 80 {
 		return template.HTML(fmt.Sprintf(`<span class="text-success" data-toggle="tooltip" title="%s"> %.0f%% - Good <i class="fas fa-smile"></i></span>`, tooltipText, eff))
 	} else if eff > 60 {
 		return template.HTML(fmt.Sprintf(`<span class="text-warning" data-toggle="tooltip" title="%s"> %.0f%% - Fair <i class="fas fa-meh"></i></span>`, tooltipText, eff))
 	} else {
 		return template.HTML(fmt.Sprintf(`<span class="text-danger" data-toggle="tooltip" title="%s"> %.0f%% - Bad <i class="fas fa-frown"></i></span>`, tooltipText, eff))
+	}
+}
+
+func FormatBeaconscore(score float64, includeIcon bool) template.HTML {
+	score = score * 100
+	tooltipText := ""
+	tooltipAdditionalText := "<br /><br />Read more about how we calculate the BeaconScore in our <a href='https://kb.beaconcha.in/v2beta/metric-validator-efficiency' target='_blank'>docs</a>."
+	if score < 0 {
+		tooltipText = "No active validators found"
+		return `<span class="text-info" data-toggle="tooltip" title="No active validators found">N/A</span>`
+	} else if score >= 99.5 {
+		tooltipText = "A BeaconScore of 99.5% or higher is exceptional."
+		iconHtml := ` - <i class="fas fa-grin-stars"></i>`
+		if !includeIcon {
+			iconHtml = ""
+		}
+		return template.HTML(fmt.Sprintf(`<span class="text-success" data-tippy-content="%s"> %.2f%%%s</span>`, tooltipText+tooltipAdditionalText, score, iconHtml))
+	} else if score > 99.0 {
+		tooltipText = "A BeaconScore between 99.0% and 99.5% is excellent."
+		iconHtml := ` - <i class="fas fa-smile"></i>`
+		if !includeIcon {
+			iconHtml = ""
+		}
+		return template.HTML(fmt.Sprintf(`<span class="text-success" data-tippy-content="%s"> %.2f%%%s</span>`, tooltipText+tooltipAdditionalText, score, iconHtml))
+	} else if score > 98.0 {
+		tooltipText = "A BeaconScore between 98.0% and 99.0% is fair."
+		iconHtml := ` - <i class="fas fa-meh"></i>`
+		if !includeIcon {
+			iconHtml = ""
+		}
+		return template.HTML(fmt.Sprintf(`<span class="text-warning" data-tippy-content="%s"> %.2f%%%s</span>`, tooltipText+tooltipAdditionalText, score, iconHtml))
+	} else {
+		tooltipText = "A BeaconScore below 98.0% is bad."
+		iconHtml := ` - <i class="fas fa-frown"></i>`
+		if !includeIcon {
+			iconHtml = ""
+		}
+		return template.HTML(fmt.Sprintf(`<span class="text-danger" data-tippy-content="%s"> %.2f%%%s</span>`, tooltipText+tooltipAdditionalText, score, iconHtml))
+	}
+}
+
+func FormatEfficiency(score float64) template.HTML {
+	score = score * 100
+	if score < 0 {
+		return `<span>N/A</span>`
+	} else {
+		return template.HTML(fmt.Sprintf(`<span">%.2f%%</span>`, score))
 	}
 }
 

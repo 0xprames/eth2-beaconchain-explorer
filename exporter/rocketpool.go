@@ -11,8 +11,9 @@ import (
 	"sync"
 	"time"
 
-	"eth2-exporter/db"
-	"eth2-exporter/utils"
+	"github.com/gobitfly/eth2-beaconchain-explorer/db"
+	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
+	"github.com/pkg/errors"
 
 	"github.com/ethereum/go-ethereum/common"
 	"github.com/ethereum/go-ethereum/ethclient"
@@ -47,6 +48,12 @@ var rpEth1Client *ethclient.Client
 const GethEventLogInterval = 25000
 
 var RP_CONFIG *smartnodeCfg.SmartnodeConfig
+var firstBlockOfRedstone = map[string]uint64{
+	"mainnet": 15451165,
+	"prater":  7287326,
+	"holesky": 0,
+	"hoodi":   0, // TODO: dont know
+}
 
 var leb16, _ = big.NewInt(0).SetString("16000000000000000000", 10)
 
@@ -80,8 +87,8 @@ func initRPConfig() *smartnodeCfg.SmartnodeConfig {
 	})
 	if utils.Config.Chain.Name == "mainnet" {
 		config.Network.Value = smartnodeNetwork.Network_Mainnet
-	} else if utils.Config.Chain.Name == "prater" {
-		config.Network.Value = smartnodeNetwork.Network_Prater
+	} else if utils.Config.Chain.Name == "holesky" {
+		config.Network.Value = smartnodeNetwork.Network_Holesky
 	} else {
 		logrus.Warnf("unknown network")
 	}
@@ -131,7 +138,7 @@ func NewRocketpoolExporter(eth1Client *ethclient.Client, storageContractAddressH
 	rpe.Eth1Client = eth1Client
 	rpe.API = rp
 	rpe.DB = db
-	rpe.UpdateInterval = time.Second * 60
+	rpe.UpdateInterval = time.Minute
 	rpe.MinipoolsByAddress = map[string]*RocketpoolMinipool{}
 	rpe.NodesByAddress = map[string]*RocketpoolNode{}
 	rpe.DAOProposalsByID = map[uint64]*RocketpoolDAOProposal{}
@@ -212,7 +219,7 @@ func (rp *RocketpoolExporter) InitDAOMembers() error {
 }
 
 func (rp *RocketpoolExporter) Run() error {
-	errorInterval := time.Second * 60
+	errorInterval := time.Minute
 	t := time.NewTicker(rp.UpdateInterval)
 	defer t.Stop()
 	var count int64 = 0
@@ -287,6 +294,7 @@ func (rp *RocketpoolExporter) DownloadMissingRewardTrees() error {
 				IsNativeMode: true,
 			},
 			interval,
+			nil,
 		)
 		if err != nil {
 			if strings.Contains(err.Error(), "found") { // could not be found && not found
@@ -355,14 +363,9 @@ func contains(s []RocketpoolRewardTreeDownloadable, e uint64) bool {
 
 func (rp *RocketpoolExporter) Update(count int64) error {
 	var wg errgroup.Group
-	wg.Go(func() error {
-		if count == 0 || count%5 == 4 { // run download one iteration before we update nodes
-			return rp.DownloadMissingRewardTrees()
-		}
-		return nil
-	})
+	wg.Go(func() error { return rp.DownloadMissingRewardTrees() })
 	wg.Go(func() error { return rp.UpdateMinipools() })
-	wg.Go(func() error { return rp.UpdateNodes(count%5 == 0) })
+	wg.Go(func() error { return rp.UpdateNodes(true) })
 	wg.Go(func() error { return rp.UpdateDAOProposals() })
 	wg.Go(func() error { return rp.UpdateDAOMembers() })
 	wg.Go(func() error { return rp.UpdateNetworkStats() })
@@ -1211,10 +1214,6 @@ func (rp *RocketpoolExporter) TagValidators() error {
 		if err != nil {
 			return fmt.Errorf("error inserting into validator_tags: %w", err)
 		}
-		_, err = tx.Exec(fmt.Sprintf(`insert into validator_pool (publickey, pool) values %s on conflict (publickey) do nothing`, strings.Join(valueStrings, ",")), valueArgs...)
-		if err != nil {
-			return fmt.Errorf("error inserting into validator_pool: %w", err)
-		}
 	}
 
 	return tx.Commit()
@@ -1580,14 +1579,16 @@ func CalculateLifetimeNodeRewardsAllLegacy(rp *rocketpool.RocketPool, intervalSi
 	// Construct a filter query for relevant logs
 	addressFilter := []common.Address{*rocketRewardsPool.Address}
 	// RPLTokensClaimed(address clamingContract, address claimingAddress, uint256 amount, uint256 time)
-	topicFilter := [][]common.Hash{{rocketRewardsPool.ABI.Events["RPLTokensClaimed"].ID}, {rocketClaimNode.Address.Hash()}}
+	topicFilter := [][]common.Hash{{rocketRewardsPool.ABI.Events["RPLTokensClaimed"].ID}, {common.BytesToHash(rocketClaimNode.Address[:])}}
 
-	prerecordedIntervals := RP_CONFIG.GetRewardsSubmissionBlockMaps()
+	sumMap := make(map[string]*big.Int)
+	prerecordedIntervals, exists := firstBlockOfRedstone[utils.Config.Chain.Name]
 	var maxBlockNumber *big.Int = nil
-	if len(prerecordedIntervals) > 0 {
-		// only look for legacy lifetime rewards before the new rewards system went live
-		maxBlockNumber = big.NewInt(0).SetUint64(prerecordedIntervals[0])
+	if prerecordedIntervals == 0 || !exists {
+		return sumMap, nil
 	}
+	// only look for legacy lifetime rewards before the new rewards system went live
+	maxBlockNumber = big.NewInt(0).SetUint64(prerecordedIntervals)
 
 	// Get the event logs
 	logs, err := eth.GetLogs(rp, addressFilter, topicFilter, intervalSize, nil, maxBlockNumber, nil)
@@ -1596,7 +1597,6 @@ func CalculateLifetimeNodeRewardsAllLegacy(rp *rocketpool.RocketPool, intervalSi
 	}
 
 	// Iterate over the logs and sum the amount
-	sumMap := make(map[string]*big.Int)
 	for _, log := range logs {
 		values := make(map[string]interface{})
 		// Decode the event
@@ -1863,19 +1863,29 @@ func (b *QuotedBigInt) UnmarshalJSON(p []byte) error {
 }
 
 func DownloadRewardsFile(fileName string, interval uint64, cid string, isDaemon bool) ([]byte, error) {
-
 	ipfsFilename := fileName + ".zst"
+
+	split := strings.Split(fileName, "-")
+	var network string
+	if len(split) > 3 {
+		network = split[2]
+	}
+
+	client := &http.Client{
+		Timeout: 40 * time.Second,
+	}
 
 	// Create URL list
 	urls := []string{
 		fmt.Sprintf("https://%s.ipfs.dweb.link/%s", cid, ipfsFilename),
 		fmt.Sprintf("https://ipfs.io/ipfs/%s/%s", cid, ipfsFilename),
+		fmt.Sprintf("https://github.com/rocket-pool/rewards-trees/raw/main/%s/%s", network, fileName),
 	}
 
 	// Attempt downloads
 	errBuilder := strings.Builder{}
 	for _, url := range urls {
-		resp, err := http.Get(url)
+		resp, err := client.Get(url)
 		if err != nil {
 			errBuilder.WriteString(fmt.Sprintf("Downloading %s failed (%s)\n", url, err.Error()))
 			continue
@@ -1894,17 +1904,20 @@ func DownloadRewardsFile(fileName string, interval uint64, cid string, isDaemon 
 			}
 
 			// Decompress it
-			decompressedBytes, err := decompressFile(bytes)
-			if err != nil {
-				errBuilder.WriteString(fmt.Sprintf("Error decompressing %s: %s\n", url, err.Error()))
-				continue
+			writeBytes := bytes
+			if strings.HasSuffix(url, ".zst") {
+				writeBytes, err = decompressFile(bytes)
+				if err != nil {
+					errBuilder.WriteString(fmt.Sprintf("Error decompressing %s: %s\n", url, err.Error()))
+					continue
+				}
 			}
 
-			return decompressedBytes, nil
+			return writeBytes, nil
 		}
 	}
 
-	return nil, fmt.Errorf(errBuilder.String())
+	return nil, errors.New(errBuilder.String())
 
 }
 

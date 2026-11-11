@@ -28,6 +28,8 @@ type ClChainConfig struct {
 	CappellaForkEpoch    uint64 `yaml:"CAPELLA_FORK_EPOCH"`
 	DenebForkVersion     string `yaml:"DENEB_FORK_VERSION"`
 	DenebForkEpoch       uint64 `yaml:"DENEB_FORK_EPOCH"`
+	ElectraForkVersion   string `yaml:"ELECTRA_FORK_VERSION"`
+	ElectraForkEpoch     uint64 `yaml:"ELECTRA_FORK_EPOCH"`
 	Eip6110ForkVersion   string `yaml:"EIP6110_FORK_VERSION"`
 	Eip6110ForkEpoch     uint64 `yaml:"EIP6110_FORK_EPOCH"`
 	Eip7002ForkVersion   string `yaml:"EIP7002_FORK_VERSION"`
@@ -45,6 +47,7 @@ type ClChainConfig struct {
 	EjectionBalance                  uint64 `yaml:"EJECTION_BALANCE"`
 	MinPerEpochChurnLimit            uint64 `yaml:"MIN_PER_EPOCH_CHURN_LIMIT"`
 	ChurnLimitQuotient               uint64 `yaml:"CHURN_LIMIT_QUOTIENT"`
+	MaxPerEpochActivationChurnLimit  uint64 `yaml:"MAX_PER_EPOCH_ACTIVATION_CHURN_LIMIT"`
 	// fork choice
 	ProposerScoreBoost uint64 `yaml:"PROPOSER_SCORE_BOOST"`
 	// deposit contract
@@ -139,4 +142,14 @@ type ClChainConfig struct {
 	FieldElementsPerBlob       uint64 `yaml:"FIELD_ELEMENTS_PER_BLOB"`
 	MaxBlobCommitmentsPerBlock uint64 `yaml:"MAX_BLOB_COMMITMENTS_PER_BLOCK"`
 	MaxBlobsPerBlock           uint64 `yaml:"MAX_BLOBS_PER_BLOCK"`
+
+	// electra
+	MinPerEpochChurnLimitElectra        uint64 `yaml:"MIN_PER_EPOCH_CHURN_LIMIT_ELECTRA"`
+	MaxPerEpochActivationExitChurnLimit uint64 `yaml:"MAX_PER_EPOCH_ACTIVATION_EXIT_CHURN_LIMIT"`
+	BlobSidecarSubnetCountElectra       uint64 `yaml:"BLOB_SIDECAR_SUBNET_COUNT_ELECTRA"`
+	MaxBlobsPerBlockElectra             uint64 `yaml:"MAX_BLOBS_PER_BLOCK_ELECTRA"`
+	MaxRequestBlobSidecarsElectra       uint64 `yaml:"MAX_REQUEST_BLOB_SIDECARS_ELECTRA"`
+	MinActivationBalance                uint64 `yaml:"MIN_ACTIVATION_BALANCE"`
+	MaxPendingDepositsPerEpoch          uint64 `yaml:"MAX_PENDING_DEPOSITS_PER_EPOCH"`
+	MaxEffectiveBalanceElectra          uint64 `yaml:"MAX_EFFECTIVE_BALANCE_ELECTRA"`
 }

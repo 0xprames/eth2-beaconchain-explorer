@@ -11,9 +11,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"eth2-exporter/config"
-	"eth2-exporter/price"
-	"eth2-exporter/types"
 	"fmt"
 	"html/template"
 	"image/color"
@@ -31,8 +28,13 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"syscall"
 	"time"
 	"unicode/utf8"
+
+	"github.com/gobitfly/eth2-beaconchain-explorer/config"
+	"github.com/gobitfly/eth2-beaconchain-explorer/price"
+	"github.com/gobitfly/eth2-beaconchain-explorer/types"
 
 	"golang.org/x/text/cases"
 	"golang.org/x/text/language"
@@ -48,11 +50,12 @@ import (
 	"github.com/kelseyhightower/envconfig"
 	"github.com/lib/pq"
 	"github.com/mvdan/xurls"
-	"github.com/prysmaticlabs/prysm/v3/beacon-chain/core/signing"
-	prysm_params "github.com/prysmaticlabs/prysm/v3/config/params"
+	"github.com/prysmaticlabs/prysm/v5/beacon-chain/core/signing"
+	prysm_params "github.com/prysmaticlabs/prysm/v5/config/params"
 	"github.com/shopspring/decimal"
 	"github.com/sirupsen/logrus"
 	"github.com/skip2/go-qrcode"
+	confusables "github.com/skygeario/go-confusable-homoglyphs"
 )
 
 // Config is the globally accessible configuration
@@ -82,14 +85,15 @@ func GetTemplateFuncs() template.FuncMap {
 		"includeHTML":                             IncludeHTML,
 		"includeSvg":                              IncludeSvg,
 		"formatHTML":                              FormatMessageToHtml,
+		"safeHTML":                                SafeHTML,
 		"formatBalance":                           FormatBalance,
 		"formatNotificationChannel":               FormatNotificationChannel,
 		"formatBalanceSql":                        FormatBalanceSql,
 		"formatCurrentBalance":                    FormatCurrentBalance,
-		"formatCurrency":                          FormatCurrency,
 		"formatElCurrency":                        FormatElCurrency,
 		"formatClCurrency":                        FormatClCurrency,
 		"formatEffectiveBalance":                  FormatEffectiveBalance,
+		"formatBlockNumber":                       FormatBlockNumber,
 		"formatBlockStatus":                       FormatBlockStatus,
 		"formatBlockSlot":                         FormatBlockSlot,
 		"formatSlotToTimestamp":                   FormatSlotToTimestamp,
@@ -105,9 +109,12 @@ func GetTemplateFuncs() template.FuncMap {
 		"formatEth1TxHash":                        FormatEth1TxHash,
 		"formatGraffiti":                          FormatGraffiti,
 		"formatHash":                              FormatHash,
+		"formatDepositStatus":                     FormatDepositStatus,
+		"formatConsolidationStatus":               FormatConsolidationStatus,
 		"formatWithdawalCredentials":              FormatWithdawalCredentials,
 		"formatAddressToWithdrawalCredentials":    FormatAddressToWithdrawalCredentials,
 		"formatBitlist":                           FormatBitlist,
+		"formatCommitteeBitList":                  FormatCommitteeBitList,
 		"formatBitvectorValidators":               formatBitvectorValidators,
 		"formatParticipation":                     FormatParticipation,
 		"formatIncome":                            FormatIncome,
@@ -121,6 +128,8 @@ func GetTemplateFuncs() template.FuncMap {
 		"formatPercentageWithPrecision":           FormatPercentageWithPrecision,
 		"formatPercentageWithGPrecision":          FormatPercentageWithGPrecision,
 		"formatPercentageColoredEmoji":            FormatPercentageColoredEmoji,
+		"formatBeaconscore":                       FormatBeaconscore,
+		"formatEfficiency":                        FormatEfficiency,
 		"formatPublicKey":                         FormatPublicKey,
 		"formatSlashedValidator":                  FormatSlashedValidator,
 		"formatSlashedValidatorInt64":             FormatSlashedValidatorInt64,
@@ -176,7 +185,7 @@ func GetTemplateFuncs() template.FuncMap {
 			p := message.NewPrinter(language.English)
 			return p.Sprintf("%v\n", i)
 		},
-		"formatThousandsInt": func(i int) string {
+		"formatThousandsInt": func(i any) string {
 			p := message.NewPrinter(language.English)
 			return p.Sprintf("%d", i)
 		},
@@ -229,7 +238,6 @@ func GetTemplateFuncs() template.FuncMap {
 		"formatPoolPerformance":            FormatPoolPerformance,
 		"formatTokenSymbolTitle":           FormatTokenSymbolTitle,
 		"formatTokenSymbol":                FormatTokenSymbol,
-		"formatTokenSymbolHTML":            FormatTokenSymbolHTML,
 		"dict": func(values ...interface{}) (map[string]interface{}, error) {
 			if len(values)%2 != 0 {
 				return nil, errors.New("invalid dict call")
@@ -244,6 +252,8 @@ func GetTemplateFuncs() template.FuncMap {
 			}
 			return dict, nil
 		},
+		// URL helpers for correct path encoding in templates (spaces -> %20, not +)
+		"urlPathEscape": func(s string) string { return url.PathEscape(s) },
 	}
 }
 
@@ -255,6 +265,22 @@ func IncludeHTML(path string) template.HTML {
 		return ""
 	}
 	return template.HTML(string(b))
+}
+
+// SafeHTML marks a value as trusted HTML so it won't be escaped by the template engine.
+// It accepts either a string, template.HTML, or []byte and returns template.HTML.
+// WARNING: Only use this with content that is already sanitized or fully trusted.
+func SafeHTML(v interface{}) template.HTML {
+	switch t := v.(type) {
+	case template.HTML:
+		return t
+	case string:
+		return template.HTML(t)
+	case []byte:
+		return template.HTML(string(t))
+	default:
+		return template.HTML(fmt.Sprint(t))
+	}
 }
 
 func GraffitiToString(graffiti []byte) string {
@@ -360,12 +386,12 @@ func EpochToTime(epoch uint64) time.Time {
 
 // TimeToDay will return a days since genesis for an timestamp
 func TimeToDay(timestamp uint64) uint64 {
-	return uint64(time.Unix(int64(timestamp), 0).Sub(time.Unix(int64(Config.Chain.GenesisTimestamp), 0)).Hours() / 24)
-	// return time.Unix(int64(Config.Chain.GenesisTimestamp), 0).Add(time.Hour * time.Duration(24*int(day)))
+	const hoursInADay = float64(Day / time.Hour)
+	return uint64(time.Unix(int64(timestamp), 0).Sub(time.Unix(int64(Config.Chain.GenesisTimestamp), 0)).Hours() / hoursInADay)
 }
 
 func DayToTime(day int64) time.Time {
-	return time.Unix(int64(Config.Chain.GenesisTimestamp), 0).Add(time.Hour * time.Duration(24*int(day)))
+	return time.Unix(int64(Config.Chain.GenesisTimestamp), 0).Add(Day * time.Duration(day))
 }
 
 // TimeToEpoch will return an epoch for a given time
@@ -395,7 +421,7 @@ func GWeiBytesToEther(gwei []byte) decimal.Decimal {
 // WaitForCtrlC will block/wait until a control-c is pressed
 func WaitForCtrlC() {
 	c := make(chan os.Signal, 1)
-	signal.Notify(c, os.Interrupt)
+	signal.Notify(c, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
 	<-c
 }
 
@@ -451,6 +477,14 @@ func ReadConfig(cfg *types.Config, path string) error {
 			err = yaml.Unmarshal([]byte(config.GnosisChainYml), &cfg.Chain.ClConfig)
 		case "holesky":
 			err = yaml.Unmarshal([]byte(config.HoleskyChainYml), &cfg.Chain.ClConfig)
+		case "hoodi":
+			err = yaml.Unmarshal([]byte(config.HoodiChainYml), &cfg.Chain.ClConfig)
+		case "mekong":
+			err = yaml.Unmarshal([]byte(config.MekongChainYml), &cfg.Chain.ClConfig)
+		case "pectra-devnet-5":
+			err = yaml.Unmarshal([]byte(config.PectraDevnet5ChainYml), &cfg.Chain.ClConfig)
+		case "pectra-devnet-6":
+			err = yaml.Unmarshal([]byte(config.PectraDevnet6ChainYml), &cfg.Chain.ClConfig)
 		default:
 			return fmt.Errorf("tried to set known chain-config, but unknown chain-name: %v (path: %v)", cfg.Chain.Name, cfg.Chain.ClConfigPath)
 		}
@@ -493,6 +527,8 @@ func ReadConfig(cfg *types.Config, path string) error {
 			CappellaForkEpoch:                       mustParseUint(jr.Data.CapellaForkEpoch),
 			DenebForkVersion:                        jr.Data.DenebForkVersion,
 			DenebForkEpoch:                          mustParseUint(jr.Data.DenebForkEpoch),
+			ElectraForkVersion:                      jr.Data.ElectraForkVersion,
+			ElectraForkEpoch:                        mustParseUint(jr.Data.ElectraForkEpoch),
 			SecondsPerSlot:                          mustParseUint(jr.Data.SecondsPerSlot),
 			SecondsPerEth1Block:                     mustParseUint(jr.Data.SecondsPerEth1Block),
 			MinValidatorWithdrawabilityDelay:        mustParseUint(jr.Data.MinValidatorWithdrawabilityDelay),
@@ -503,6 +539,7 @@ func ReadConfig(cfg *types.Config, path string) error {
 			EjectionBalance:                         mustParseUint(jr.Data.EjectionBalance),
 			MinPerEpochChurnLimit:                   mustParseUint(jr.Data.MinPerEpochChurnLimit),
 			ChurnLimitQuotient:                      mustParseUint(jr.Data.ChurnLimitQuotient),
+			MaxPerEpochActivationChurnLimit:         mustParseUint(jr.Data.MaxPerEpochActivationChurnLimit),
 			ProposerScoreBoost:                      mustParseUint(jr.Data.ProposerScoreBoost),
 			DepositChainID:                          mustParseUint(jr.Data.DepositChainID),
 			DepositNetworkID:                        mustParseUint(jr.Data.DepositNetworkID),
@@ -556,6 +593,15 @@ func ReadConfig(cfg *types.Config, path string) error {
 			MaxWithdrawalsPerPayload:                mustParseUint(jr.Data.MaxWithdrawalsPerPayload),
 			MaxValidatorsPerWithdrawalSweep:         mustParseUint(jr.Data.MaxValidatorsPerWithdrawalsSweep),
 			MaxBlsToExecutionChange:                 mustParseUint(jr.Data.MaxBlsToExecutionChanges),
+			// Electra
+			MinPerEpochChurnLimitElectra:        mustParseUint(jr.Data.MinPerEpochChurnLimitElectra),
+			MaxPerEpochActivationExitChurnLimit: mustParseUint(jr.Data.MaxPerEpochActivationExitChurnLimit),
+			BlobSidecarSubnetCountElectra:       mustParseUint(jr.Data.BlobSidecarSubnetCountElectra),
+			MaxBlobsPerBlockElectra:             mustParseUint(jr.Data.MaxBlobsPerBlockElectra),
+			MaxRequestBlobSidecarsElectra:       mustParseUint(jr.Data.MaxRequestBlobSidecarsElectra),
+			MinActivationBalance:                mustParseUint(jr.Data.MinActivationBalance),
+			MaxPendingDepositsPerEpoch:          mustParseUint(jr.Data.MaxPendingDepositsPerEpoch),
+			MaxEffectiveBalanceElectra:          mustParseUint(jr.Data.MaxEffectiveBalanceElectra),
 		}
 
 		if jr.Data.AltairForkEpoch == "" {
@@ -568,6 +614,9 @@ func ReadConfig(cfg *types.Config, path string) error {
 			chainCfg.CappellaForkEpoch = 18446744073709551615
 		}
 		if jr.Data.DenebForkEpoch == "" {
+			chainCfg.DenebForkEpoch = 18446744073709551615
+		}
+		if jr.Data.ElectraForkEpoch == "" {
 			chainCfg.DenebForkEpoch = 18446744073709551615
 		}
 
@@ -610,6 +659,65 @@ func ReadConfig(cfg *types.Config, path string) error {
 		}
 		cfg.Chain.ClConfig = *chainConfig
 	}
+
+	type MinimalELConfig struct {
+		ByzantiumBlock      *big.Int `yaml:"BYZANTIUM_FORK_BLOCK,omitempty"`      // Byzantium switch block (nil = no fork, 0 = already on byzantium)
+		ConstantinopleBlock *big.Int `yaml:"CONSTANTINOPLE_FORK_BLOCK,omitempty"` // Constantinople switch block (nil = no fork, 0 = already activated)
+	}
+	if cfg.Chain.ElConfigPath == "" {
+		minimalCfg := MinimalELConfig{}
+		switch cfg.Chain.Name {
+		case "mainnet":
+			err = yaml.Unmarshal([]byte(config.MainnetChainYml), &minimalCfg)
+		case "prater":
+			err = yaml.Unmarshal([]byte(config.PraterChainYml), &minimalCfg)
+		case "ropsten":
+			err = yaml.Unmarshal([]byte(config.RopstenChainYml), &minimalCfg)
+		case "sepolia":
+			err = yaml.Unmarshal([]byte(config.SepoliaChainYml), &minimalCfg)
+		case "gnosis":
+			err = yaml.Unmarshal([]byte(config.GnosisChainYml), &minimalCfg)
+		case "holesky":
+			err = yaml.Unmarshal([]byte(config.HoleskyChainYml), &minimalCfg)
+		case "hoodi":
+			err = yaml.Unmarshal([]byte(config.HoodiChainYml), &minimalCfg)
+		case "mekong":
+			err = yaml.Unmarshal([]byte(config.MekongChainYml), &minimalCfg)
+		case "pectra-devnet-5":
+			err = yaml.Unmarshal([]byte(config.PectraDevnet5ChainYml), &cfg.Chain.ClConfig)
+		case "pectra-devnet-6":
+			err = yaml.Unmarshal([]byte(config.PectraDevnet6ChainYml), &cfg.Chain.ClConfig)
+		default:
+			return fmt.Errorf("tried to set known chain-config, but unknown chain-name: %v (path: %v)", cfg.Chain.Name, cfg.Chain.ElConfigPath)
+		}
+		if err != nil {
+			return err
+		}
+		if minimalCfg.ByzantiumBlock == nil {
+			minimalCfg.ByzantiumBlock = big.NewInt(0)
+		}
+		if minimalCfg.ConstantinopleBlock == nil {
+			minimalCfg.ConstantinopleBlock = big.NewInt(0)
+		}
+		cfg.Chain.ElConfig = &params.ChainConfig{
+			ChainID:             big.NewInt(int64(cfg.Chain.Id)),
+			ByzantiumBlock:      minimalCfg.ByzantiumBlock,
+			ConstantinopleBlock: minimalCfg.ConstantinopleBlock,
+		}
+	} else {
+		f, err := os.Open(cfg.Chain.ElConfigPath)
+		if err != nil {
+			return fmt.Errorf("error opening EL Chain Config file %v: %w", cfg.Chain.ElConfigPath, err)
+		}
+		var chainConfig *params.ChainConfig
+		decoder := json.NewDecoder(f)
+		err = decoder.Decode(&chainConfig)
+		if err != nil {
+			return fmt.Errorf("error decoding EL Chain Config file %v: %v", cfg.Chain.ElConfigPath, err)
+		}
+		cfg.Chain.ElConfig = chainConfig
+	}
+
 	cfg.Chain.Name = cfg.Chain.ClConfig.ConfigName
 
 	if cfg.Chain.GenesisTimestamp == 0 {
@@ -626,6 +734,8 @@ func ReadConfig(cfg *types.Config, path string) error {
 			cfg.Chain.GenesisTimestamp = 1638993340
 		case "holesky":
 			cfg.Chain.GenesisTimestamp = 1695902400
+		case "hoodi":
+			cfg.Chain.GenesisTimestamp = 1742213400
 		default:
 			return fmt.Errorf("tried to set known genesis-timestamp, but unknown chain-name")
 		}
@@ -645,6 +755,8 @@ func ReadConfig(cfg *types.Config, path string) error {
 			cfg.Chain.GenesisValidatorsRoot = "0xf5dcb5564e829aab27264b9becd5dfaa017085611224cb3036f573368dbb9d47"
 		case "holesky":
 			cfg.Chain.GenesisValidatorsRoot = "0x9143aa7c615a7f7115e2b6aac319c03529df8242ae705fba9df39b79c59fa8b1"
+		case "hoodi":
+			cfg.Chain.GenesisValidatorsRoot = "0x212f13fc4df078b6cb7db228f1c8307566dcecf900867401a92023d7ba99cb5f"
 		default:
 			return fmt.Errorf("tried to set known genesis-validators-root, but unknown chain-name")
 		}
@@ -701,6 +813,8 @@ func ReadConfig(cfg *types.Config, path string) error {
 			cfg.Chain.Id = 5
 		case "holesky":
 			cfg.Chain.Id = 17000
+		case "hoodi":
+			cfg.Chain.Id = 560048
 		case "sepolia":
 			cfg.Chain.Id = 11155111
 		case "gnosis":
@@ -714,6 +828,39 @@ func ReadConfig(cfg *types.Config, path string) error {
 	}
 
 	cfg.Chain.Id = cfg.Chain.ClConfig.DepositChainID
+
+	if cfg.RedisSessionStoreEndpoint == "" && cfg.RedisCacheEndpoint != "" {
+		logrus.Infof("using RedisCacheEndpoint %s as RedisSessionStoreEndpoint as no dedicated RedisSessionStoreEndpoint was provided", cfg.RedisCacheEndpoint)
+		cfg.RedisSessionStoreEndpoint = cfg.RedisCacheEndpoint
+	}
+
+	if cfg.Bigtable.TableNameBeaconchain == "" {
+		cfg.Bigtable.TableNameBeaconchain = "beaconchain"
+	}
+	if cfg.Bigtable.TableNameValidators == "" {
+		cfg.Bigtable.TableNameValidators = "beaconchain_validators"
+	}
+	if cfg.Bigtable.TableNameValidatorsHistory == "" {
+		cfg.Bigtable.TableNameValidatorsHistory = "beaconchain_validators_history"
+	}
+	if cfg.Bigtable.TableNameBlocks == "" {
+		cfg.Bigtable.TableNameBlocks = "blocks"
+	}
+	if cfg.Bigtable.TableNameData == "" {
+		cfg.Bigtable.TableNameData = "data"
+	}
+	if cfg.Bigtable.TableNameMachineMetrics == "" {
+		cfg.Bigtable.TableNameMachineMetrics = "machine_metrics"
+	}
+	if cfg.Bigtable.TableNameMetadata == "" {
+		cfg.Bigtable.TableNameMetadata = "metadata"
+	}
+	if cfg.Bigtable.TableNameMetadataUpdates == "" {
+		cfg.Bigtable.TableNameMetadataUpdates = "metadata_updates"
+	}
+	if cfg.Bigtable.TableNameBlocksRaw == "" {
+		cfg.Bigtable.TableNameBlocksRaw = "blocks-raw"
+	}
 
 	logrus.WithFields(logrus.Fields{
 		"genesisTimestamp":       cfg.Chain.GenesisTimestamp,
@@ -742,6 +889,29 @@ func mustParseUint(str string) uint64 {
 	}
 
 	return nbr
+}
+
+func GetMaxEffectiveBalance(currentEpoch uint64) uint64 {
+	if Config.Chain.ClConfig.ElectraForkEpoch >= currentEpoch {
+		return Config.Chain.ClConfig.MaxEffectiveBalanceElectra
+	}
+	return Config.Chain.ClConfig.MaxEffectiveBalance
+}
+
+func GetMaxEffectiveBalanceByWithdrawalCredentials(withCred []byte) uint64 {
+	if len(withCred) == 0 {
+		return 0
+	}
+	switch withCred[0] {
+	case 0x00, 0x01:
+		// phase0, capella
+		return Config.Chain.ClConfig.MaxEffectiveBalance
+	case 0x02:
+		// electra
+		return Config.Chain.ClConfig.MaxEffectiveBalanceElectra
+	default:
+		return 0
+	}
 }
 
 func readConfigFile(cfg *types.Config, path string) error {
@@ -800,7 +970,7 @@ func IsApiRequest(r *http.Request) bool {
 
 var eth1AddressRE = regexp.MustCompile("^(0x)?[0-9a-fA-F]{40}$")
 var withdrawalCredentialsRE = regexp.MustCompile("^(0x)?00[0-9a-fA-F]{62}$")
-var withdrawalCredentialsAddressRE = regexp.MustCompile("^(0x)?010000000000000000000000[0-9a-fA-F]{40}$")
+var withdrawalCredentialsAddressRE = regexp.MustCompile("^(0x)?(?:0[12]0{22})[0-9A-Fa-f]{40}$")
 var eth1TxRE = regexp.MustCompile("^(0x)?[0-9a-fA-F]{64}$")
 var zeroHashRE = regexp.MustCompile("^(0x)?0+$")
 var hashRE = regexp.MustCompile("^(0x)?[0-9a-fA-F]{96}$")
@@ -810,7 +980,8 @@ func IsValidEth1Address(s string) bool {
 	return !zeroHashRE.MatchString(s) && eth1AddressRE.MatchString(s)
 }
 
-// IsEth1Address verifies whether a string represents an eth1-address. In contrast to IsValidEth1Address, this also returns true for the 0x0 address
+// IsEth1Address verifies whether a string represents an eth1-address.
+// In contrast to IsValidEth1Address, this also returns true for the 0x0 address
 func IsEth1Address(s string) bool {
 	return eth1AddressRE.MatchString(s)
 }
@@ -820,7 +991,13 @@ func IsValidEth1Tx(s string) bool {
 	return !zeroHashRE.MatchString(s) && eth1TxRE.MatchString(s)
 }
 
-// IsValidEth1Tx verifies whether a string represents a valid eth1-tx-hash.
+// IsEth1Tx verifies whether a string represents an eth1-tx-hash.
+// In contrast to IsValidEth1Tx, this also returns true for the 0x0 address
+func IsEth1Tx(s string) bool {
+	return eth1TxRE.MatchString(s)
+}
+
+// IsHash verifies whether a string represents an eth1-hash.
 func IsHash(s string) bool {
 	return hashRE.MatchString(s)
 }
@@ -1316,34 +1493,24 @@ func FormatPoolPerformance(val float64) template.HTML {
 }
 
 func FormatTokenSymbolTitle(symbol string) string {
-	urls := xurls.Relaxed.FindAllString(symbol, -1)
-
-	if len(urls) > 0 {
-		return fmt.Sprintf("The token symbol has been hidden as it contains a URL (%s) which might be a scam", symbol)
-	} else if symbol == "ETH" {
-		return fmt.Sprintf("The token symbol has been hidden as it contains a Token name (%s) which might be a scam", symbol)
+	if isMaliciousToken(symbol) {
+		return fmt.Sprintf("The token symbol (%s) has been hidden because it contains a URL or a confusable character", symbol)
 	}
 	return ""
 }
 
 func FormatTokenSymbol(symbol string) string {
-	urls := xurls.Relaxed.FindAllString(symbol, -1)
-
-	if len(urls) > 0 ||
-		symbol == "ETH" {
+	if isMaliciousToken(symbol) {
 		return "[hidden-symbol] ⚠️"
 	}
 	return symbol
 }
 
-func FormatTokenSymbolHTML(tmpl template.HTML) template.HTML {
-	tmplString := (string(tmpl))
-	symbolTitle := FormatTokenSymbolTitle(tmplString)
-
-	tmplString = FormatTokenSymbol(tmplString)
-	tmpl = template.HTML(strings.ReplaceAll(tmplString, `title=""`, fmt.Sprintf(`title="%s"`, symbolTitle)))
-
-	return tmpl
+func isMaliciousToken(symbol string) bool {
+	containsUrls := len(xurls.Relaxed.FindAllString(symbol, -1)) > 0
+	isConfusable := len(confusables.IsConfusable(symbol, false, []string{"LATIN", "COMMON"})) > 0
+	isMixedScript := confusables.IsMixedScript(symbol, nil)
+	return containsUrls || isConfusable || isMixedScript || strings.ToUpper(symbol) == "ETH"
 }
 
 func ReverseSlice[S ~[]E, E any](s S) {
@@ -1369,13 +1536,12 @@ func GetTimeToNextWithdrawal(distance uint64) time.Time {
 }
 
 func EpochsPerDay() uint64 {
-	day := time.Hour * 24
-	return (uint64(day.Seconds()) / Config.Chain.ClConfig.SlotsPerEpoch) / Config.Chain.ClConfig.SecondsPerSlot
+	return (uint64(Day.Seconds()) / Config.Chain.ClConfig.SlotsPerEpoch) / Config.Chain.ClConfig.SecondsPerSlot
 }
 
-func GetFirstAndLastEpochForDay(day uint64) (uint64, uint64) {
-	firstEpoch := day * EpochsPerDay()
-	lastEpoch := firstEpoch + EpochsPerDay() - 1
+func GetFirstAndLastEpochForDay(day uint64) (firstEpoch uint64, lastEpoch uint64) {
+	firstEpoch = day * EpochsPerDay()
+	lastEpoch = firstEpoch + EpochsPerDay() - 1
 	return firstEpoch, lastEpoch
 }
 
@@ -1423,6 +1589,12 @@ func LogFatal(err error, errorMsg interface{}, callerSkip int, additionalInfos .
 // callerSkip equal to 0 gives you info directly where LogError is called.
 func LogError(err error, errorMsg interface{}, callerSkip int, additionalInfos ...map[string]interface{}) {
 	logErrorInfo(err, callerSkip, additionalInfos...).Error(errorMsg)
+}
+
+// LogError logs a warning with callstack info that skips callerSkip many levels with arbitrarily many additional infos.
+// callerSkip equal to 0 gives you info directly where LogError is called.
+func LogWarn(err error, errorMsg interface{}, callerSkip int, additionalInfos ...map[string]interface{}) {
+	logErrorInfo(err, callerSkip, additionalInfos...).Warn(errorMsg)
 }
 
 func logErrorInfo(err error, callerSkip int, additionalInfos ...map[string]interface{}) *logrus.Entry {
@@ -1727,4 +1899,90 @@ func ReverseString(s string) string {
 func GetCurrentFuncName() string {
 	pc, _, _, _ := runtime.Caller(1)
 	return runtime.FuncForPC(pc).Name()
+}
+
+func GetParentFuncName() string {
+	pc, _, _, _ := runtime.Caller(2)
+	return runtime.FuncForPC(pc).Name()
+}
+
+// Returns true if the given block number is 0 and if it is (according to its timestamp) included in slot 0
+//
+// This is only true for networks that launch with active PoS at block 0 which requires
+//
+//   - Belatrix happening at epoch 0 (pre condition for merged networks)
+//   - Genesis for PoS to happen at the same timestamp as the first block
+func IsPoSBlock0(number uint64, ts int64) bool {
+	if number > 0 {
+		return false
+	}
+
+	if Config.Chain.ClConfig.BellatrixForkEpoch > 0 {
+		return false
+	}
+
+	return time.Unix(int64(Config.Chain.GenesisTimestamp-Config.Chain.ClConfig.GenesisDelay), 0).UTC().Equal(time.Unix(ts, 0))
+}
+
+func GetMaxAllowedDayRangeValidatorStats(validatorAmount int) int {
+	if validatorAmount > 100000 {
+		return 0 // exact day only
+	} else if validatorAmount > 10000 {
+		return 3
+	} else if validatorAmount > 1000 {
+		return 10
+	} else {
+		return math.MaxInt
+	}
+}
+
+func FormatDepositStatus(queuedAtEpoch, processedAtEpoch int64) template.HTML {
+	if queuedAtEpoch == -2 && processedAtEpoch == -2 {
+		return `<span class="badge badge-pill bg-success text-white" style="font-size: 12px; font-weight: 500;" data-toggle="tooltip" title="The deposit was processed by the beaconchain">Processed</span>`
+	}
+	if queuedAtEpoch == -1 && processedAtEpoch == -1 {
+		return `<span class="badge badge-pill bg-light text-dark" style="font-size: 12px; font-weight: 500;" data-toggle="tooltip" title="The deposit was included by the beaconchain but has not yet been queued for processing">Pending</span>`
+	}
+
+	if queuedAtEpoch >= 0 && processedAtEpoch == -1 {
+		return `<span class="badge badge-pill text-dark" style="background: rgba(179, 159, 70, 0.8); font-size: 12px; font-weight: 500;" data-toggle="tooltip" title="The deposit is queued and will be processed soon">Queued</span>`
+	}
+
+	if queuedAtEpoch >= 0 && processedAtEpoch >= 0 {
+		return `<span class="badge badge-pill bg-success text-white" style="font-size: 12px; font-weight: 500;" data-toggle="tooltip" title="The deposit was processed by the beaconchain">Processed</span>`
+	}
+
+	return ""
+}
+
+func FormatConsolidationStatus(queuedAtEpoch, processedAtEpoch int64, consolidationType string) template.HTML {
+	if consolidationType == "Credentials Update" {
+		return `<span class="badge badge-pill bg-success text-white" style="font-size: 12px; font-weight: 500;">Processed</span>`
+	}
+
+	if queuedAtEpoch == -1 && processedAtEpoch == -1 {
+		return `<span class="badge badge-pill bg-light text-dark" style="font-size: 12px; font-weight: 500;" data-toggle="tooltip" title="The consolidation was included by the beaconchain but has not yet been queued for processing">Pending</span>`
+	}
+
+	if queuedAtEpoch >= 0 && processedAtEpoch == -1 {
+		return `<span class="badge badge-pill text-dark" style="background: rgba(179, 159, 70, 0.8); font-size: 12px; font-weight: 500;" data-toggle="tooltip" title="The consolidation is queued and will be processed soon">Queued</span>`
+	}
+
+	if queuedAtEpoch >= 0 && processedAtEpoch >= 0 {
+		return template.HTML(fmt.Sprintf(`<span class="badge badge-pill bg-success text-white" style="font-size: 12px; font-weight: 500;" data-toggle="tooltip" title="The consolidation was processed in epoch %d by the beaconchain">Processed</span>`, processedAtEpoch))
+	}
+
+	return ""
+}
+
+func CalcEfficiency(dividend, divisor decimal.Decimal) float64 {
+	if divisor.IsZero() {
+		return -1
+	} // means no data is available (validator is no longer active)
+	eff := dividend.Div(divisor).InexactFloat64()
+	if eff > 1 {
+		logger.Errorf("efficiency is greater than 100: %v", eff)
+		eff = 1
+	}
+	return eff
 }

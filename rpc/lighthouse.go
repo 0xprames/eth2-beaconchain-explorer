@@ -5,8 +5,6 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
-	"eth2-exporter/types"
-	"eth2-exporter/utils"
 	"fmt"
 	"io"
 	"math"
@@ -17,7 +15,11 @@ import (
 	"sync"
 	"time"
 
+	"github.com/gobitfly/eth2-beaconchain-explorer/types"
+	"github.com/gobitfly/eth2-beaconchain-explorer/utils"
+
 	"github.com/donovanhide/eventsource"
+	"github.com/ethereum/go-ethereum/common/hexutil"
 	gtypes "github.com/ethereum/go-ethereum/core/types"
 	"golang.org/x/sync/errgroup"
 
@@ -40,7 +42,7 @@ type LighthouseClient struct {
 
 // NewLighthouseClient is used to create a new Lighthouse client
 func NewLighthouseClient(endpoint string, chainID *big.Int) (*LighthouseClient, error) {
-	signer := gtypes.NewCancunSigner(chainID)
+	signer := gtypes.NewPragueSigner(chainID)
 	client := &LighthouseClient{
 		endpoint:            endpoint,
 		assignmentsCacheMux: &sync.Mutex{},
@@ -55,8 +57,15 @@ func NewLighthouseClient(endpoint string, chainID *big.Int) (*LighthouseClient, 
 
 func (lc *LighthouseClient) GetNewBlockChan() chan *types.Block {
 	blkCh := make(chan *types.Block, 10)
+	req, err := http.NewRequest(http.MethodGet, fmt.Sprintf("%s/eth/v1/events?topics=head", lc.endpoint), nil)
+	if err != nil {
+		logger.Fatal(err, "error initializing event sse request", 0)
+	}
+	// disable gzip compression for sse
+	req.Header.Set("accept-encoding", "identity")
+
 	go func() {
-		stream, err := eventsource.Subscribe(fmt.Sprintf("%s/eth/v1/events?topics=head", lc.endpoint), "")
+		stream, err := eventsource.SubscribeWithRequest("", req)
 
 		if err != nil {
 			utils.LogFatal(err, "getting eventsource stream error", 0)
@@ -90,6 +99,22 @@ func (lc *LighthouseClient) GetNewBlockChan() chan *types.Block {
 		}
 	}()
 	return blkCh
+}
+
+// /eth/v1/beacon/states/%v/pending_deposits
+func (lc *LighthouseClient) GetPendingDeposits() (*StandardBeaconPendingDepositsResponse, error) {
+	headResp, err := lc.get(fmt.Sprintf("%s/eth/v1/beacon/states/head/pending_deposits", lc.endpoint))
+	if err != nil {
+		return nil, fmt.Errorf("error retrieving pending deposits: %w", err)
+	}
+
+	var parsedHead StandardBeaconPendingDepositsResponse
+	err = json.Unmarshal(headResp, &parsedHead)
+	if err != nil {
+		return nil, fmt.Errorf("error parsing pending deposits: %w", err)
+	}
+
+	return &parsedHead, nil
 }
 
 // GetChainHead gets the chain head from Lighthouse
@@ -161,12 +186,17 @@ func (lc *LighthouseClient) GetValidatorQueue() (*types.ValidatorQueue, error) {
 	// TODO: maybe track more status counts in the future?
 	statusMap := make(map[string]uint64)
 
+	exitingBalance := uint64(0)
 	for _, validator := range parsedValidators.Data {
 		statusMap[validator.Status] += 1
+		if validator.Status == "active_exiting" || validator.Status == "active_slashed" {
+			exitingBalance += uint64(validator.Validator.EffectiveBalance)
+		}
 	}
 	return &types.ValidatorQueue{
-		Activating: statusMap["pending_queued"],
-		Exiting:    statusMap["active_exiting"] + statusMap["active_slashed"],
+		Activating:     statusMap["pending_queued"],
+		Exiting:        statusMap["active_exiting"] + statusMap["active_slashed"],
+		ExitingBalance: exitingBalance,
 	}, nil
 }
 
@@ -994,11 +1024,12 @@ func (lc *LighthouseClient) blockFromResponse(parsedHeaders *StandardBeaconHeade
 					tx.BlobVersionedHashes = append(tx.BlobVersionedHashes, h.Bytes())
 				}
 			}
+			txs = append(txs, tx)
 		}
 		withdrawals := make([]*types.Withdrawals, 0, len(payload.Withdrawals))
 		for _, w := range payload.Withdrawals {
 			withdrawals = append(withdrawals, &types.Withdrawals{
-				Index:          uint64(w.Index),
+				Index:          int64(w.Index),
 				ValidatorIndex: uint64(w.ValidatorIndex),
 				Address:        w.Address,
 				Amount:         uint64(w.Amount),
@@ -1219,11 +1250,27 @@ func (lc *LighthouseClient) GetValidatorParticipation(epoch uint64) (*types.Vali
 	var res *types.ValidatorParticipation
 	if epoch < request_epoch {
 		// we requested the next epoch, so we have to use the previous value for everything here
+
+		prevEpochActiveGwei := parsedResponse.Data.PreviousEpochActiveGwei
+		if prevEpochActiveGwei == 0 {
+			// lh@5.2.0+ has no previous_epoch_active_gwei field anymore, see https://github.com/sigp/lighthouse/pull/5279
+			prevResp, err := lc.get(fmt.Sprintf("%s/lighthouse/validator_inclusion/%d/global", lc.endpoint, request_epoch-1))
+			if err != nil {
+				return nil, fmt.Errorf("error retrieving validator participation data for prevEpoch %v: %w", request_epoch-1, err)
+			}
+			var parsedPrevResponse LighthouseValidatorParticipationResponse
+			err = json.Unmarshal(prevResp, &parsedPrevResponse)
+			if err != nil {
+				return nil, fmt.Errorf("error parsing validator participation data for prevEpoch %v: %w", epoch, err)
+			}
+			prevEpochActiveGwei = parsedPrevResponse.Data.CurrentEpochActiveGwei
+		}
+
 		res = &types.ValidatorParticipation{
 			Epoch:                   epoch,
-			GlobalParticipationRate: float32(parsedResponse.Data.PreviousEpochTargetAttestingGwei) / float32(parsedResponse.Data.PreviousEpochActiveGwei),
+			GlobalParticipationRate: float32(parsedResponse.Data.PreviousEpochTargetAttestingGwei) / float32(prevEpochActiveGwei),
 			VotedEther:              uint64(parsedResponse.Data.PreviousEpochTargetAttestingGwei),
-			EligibleEther:           uint64(parsedResponse.Data.PreviousEpochActiveGwei),
+			EligibleEther:           uint64(prevEpochActiveGwei),
 			Finalized:               epoch <= head.FinalizedEpoch && head.JustifiedEpoch > 0,
 		}
 	} else {
@@ -1269,7 +1316,7 @@ var errNotFound = errors.New("not found 404")
 func (lc *LighthouseClient) get(url string) ([]byte, error) {
 	// t0 := time.Now()
 	// defer func() { fmt.Println(url, time.Since(t0)) }()
-	client := &http.Client{Timeout: time.Second * 120}
+	client := &http.Client{Timeout: time.Minute * 2}
 	resp, err := client.Get(url)
 	if err != nil {
 		return nil, err
@@ -1347,6 +1394,20 @@ type StandardBeaconHeaderResponse struct {
 		} `json:"header"`
 	} `json:"data"`
 	Finalized bool `json:"finalized"`
+}
+
+type StandardBeaconPendingDepositsResponse struct {
+	ExecutionOptimistic bool                                `json:"execution_optimistic"`
+	Finalized           bool                                `json:"finalized"`
+	Data                []StandardBeaconPendingDepositsData `json:"data"`
+}
+
+type StandardBeaconPendingDepositsData struct {
+	Pubkey                hexutil.Bytes `json:"pubkey"`
+	WithdrawalCredentials hexutil.Bytes `json:"withdrawal_credentials"`
+	Amount                uint64        `json:"amount,string"`
+	Signature             hexutil.Bytes `json:"signature"`
+	Slot                  uint64        `json:"slot,string"`
 }
 
 type StandardBeaconHeadersResponse struct {
